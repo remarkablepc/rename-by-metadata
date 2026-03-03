@@ -1,3 +1,9 @@
+# Trap any terminating error and pause before exit
+trap {
+    Write-Host "\nERROR: $($_.Exception.Message)"
+    Read-Host "Press Enter to exit"
+    break
+}
 
 <#
 .SYNOPSIS
@@ -31,10 +37,10 @@ Actual rename occurs when -Apply is used, when startup prompt selects rename mod
 confirmed at the end-of-preview prompt. In apply mode, live RENAMED output is shown for each
 successful rename.
 
-Interactive flow can prompt for target path, preview/apply mode, quick preview mode/limit,
-if (-not $isImmediateRenameMode) {
-- Shell metadata queries and embedded media metadata extraction can be slower on large trees.
-- Run preview first for large datasets, then execute apply mode after review.
+
+Interactive flow can prompt for target path, preview/apply mode, quick preview mode/limit.
+Shell metadata queries and embedded media metadata extraction can be slower on large trees.
+Run preview first for large datasets, then execute apply mode after review.
 
 RENAME PLAN FIELDS
 CSV fields:
@@ -56,55 +62,7 @@ MODULE INTEGRATION
 This help block is module-ready and suitable for migration into an advanced function/cmdlet
 with minimal updates to parameter metadata and examples.
 
-.PARAMETER Path
-Root folder to scan for rename candidates.
-If omitted, interactive mode defaults to the current working directory ($PWD.Path).
-
-.PARAMETER Help
-Displays command-line parameter help and exits.
-Useful for both script and EXE usage.
-
-.PARAMETER NoRecurse
-Disables recursive scanning.
-By default, recursion is enabled unless -NoRecurse is specified.
-
-.PARAMETER InteractiveSubfolders
-Prompts for each discovered subfolder to include or skip during scanning.
-Cannot be combined with -NoRecurse.
-
-.PARAMETER Apply
-Executes renames from the generated plan immediately after planning.
-If omitted, preview-first mode runs and can optionally confirm apply at end.
-
-.PARAMETER ImmediateRename
-When used with -Apply, renames files immediately during processing instead of showing
-planned entries first and then running a separate rename pass.
-
-.PARAMETER IncludeHidden
-Includes hidden files during scanning.
-
-.PARAMETER Force
-Forces metadata naming attempts regardless of generic filename heuristics.
-
-.PARAMETER OnlyGeneric
-Only attempts renames for filenames that look generic (for example file123, img_0001, dsc0002).
-
-.PARAMETER ReportPath
-Optional path for TXT report output.
-If omitted, a timestamped TXT report file is created in the scan root.
-Backward-compatible alias: -PreviewReportPath.
-
-.PARAMETER CsvPath
-Optional path for CSV report output.
-If omitted, a CSV path is derived from the TXT report path.
-Backward-compatible alias: -PreviewCsvPath.
-
-.PARAMETER QuickPreview
-Limits discovery to a small sample set for faster preview validation.
-By default this previews the sampled set and then offers an end-of-preview apply prompt.
-If used with -Apply, renames are applied to the sampled file set without the preview-only stop.
-
-.PARAMETER QuickPreviewLimit
+if (-not $isImmediateRenameMode) {
 Maximum number of files to evaluate in -QuickPreview mode.
 Default is 200.
 
@@ -281,89 +239,28 @@ Displays command-line parameter help in the compiled EXE.
 Pipeline input is not currently supported.
 Use -Path to specify the scan root for this script version.
 #>
-[CmdletBinding(SupportsShouldProcess = $true)]
-param(
-    [Parameter(Position = 0)]
-    [string]$Path,
 
-    [Alias('?')]
-    [switch]$Help,
+# Script-wide confidence score matrix
+$null = $true # test assignment to confirm parsing
 
-    [switch]$NoRecurse,
-
-    [switch]$InteractiveSubfolders,
-
-    [switch]$IncludeHidden,
-
-    [switch]$Force,
-
-    [switch]$OnlyGeneric,
-
-    [switch]$Apply,
-
-    [switch]$ImmediateRename,
-
-    [switch]$QuickPreview,
-
-    [ValidateRange(1, 100000)]
-    [int]$QuickPreviewLimit = 200,
-
-    [Alias('PreviewReportPath')]
-    [string]$ReportPath,
-
-    [Alias('PreviewCsvPath')]
-    [string]$CsvPath,
-
-    [string]$LogPath,
-
-    [switch]$Resume,
-
-    [string]$ResumeLogPath,
-
-    [switch]$RetryErrors,
-
-    [string]$RetryErrorsLogPath,
-
-    [switch]$IntelligentScan,
-
-    [switch]$IncludeOtherFiles,
-
-    [switch]$ScanOtherFilesAtEnd,
-
-    [switch]$ListUncommonFiles,
-
-    [switch]$NoAutoResumePrompt,
-
-    [switch]$SkipLikelyAlreadyRenamed,
-
-    [ValidateRange(5, 600)]
-    [int]$PerFileTimeoutSeconds = 20,
-
-    [ValidateRange(100, 50000)]
-    [int]$BatchSize = 500
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
-$script:ScoreMatrix = [ordered]@{
-    'DOCX core title'              = [PSCustomObject]@{ Score = 98; Reason = 'Embedded canonical document title' }
-    'DOCX heading title'           = [PSCustomObject]@{ Score = 92; Reason = 'Document heading structure from app.xml' }
-    'Word OpenXML core title'      = [PSCustomObject]@{ Score = 98; Reason = 'Embedded Word OpenXML canonical document title' }
-    'Word heading title'           = [PSCustomObject]@{ Score = 92; Reason = 'Word heading structure from app.xml TitlesOfParts' }
-    'RTF title control word'       = [PSCustomObject]@{ Score = 96; Reason = 'Embedded RTF \title metadata control word' }
-    'Word COM title'               = [PSCustomObject]@{ Score = 90; Reason = 'Word built-in document title via COM automation' }
-    'PDF XMP title'                = [PSCustomObject]@{ Score = 94; Reason = 'Embedded PDF XMP title metadata' }
-    'PDF bookmark title'           = [PSCustomObject]@{ Score = 89; Reason = 'First PDF outline/bookmark title' }
-    'XML title node'               = [PSCustomObject]@{ Score = 93; Reason = 'Structured XML title element' }
-    'Image embedded XMP title'     = [PSCustomObject]@{ Score = 95; Reason = 'Embedded authored image title metadata' }
-    'Windows metadata title'       = [PSCustomObject]@{ Score = 88; Reason = 'Windows semantic metadata title field' }
-    'Audio composite metadata'     = [PSCustomObject]@{ Score = 91; Reason = 'Artist/title/album/track composite metadata' }
-    'Audio title metadata'         = [PSCustomObject]@{ Score = 85; Reason = 'Audio title metadata only' }
-    'Video episode metadata'       = [PSCustomObject]@{ Score = 87; Reason = 'Season/episode/media title metadata' }
-    'GPS location metadata'        = [PSCustomObject]@{ Score = 80; Reason = 'Location metadata from GPS fields' }
-    'Media date metadata'          = [PSCustomObject]@{ Score = 72; Reason = 'Date-based media fallback naming' }
-    'Author/company metadata'      = [PSCustomObject]@{ Score = 62; Reason = 'Attribution fallback metadata' }
+$script:ScoreMatrix = @{
+    'DOCX core title' = [PSCustomObject]@{ Score = 98; Reason = 'Embedded canonical document title' }
+    'DOCX heading title' = [PSCustomObject]@{ Score = 92; Reason = 'Document heading structure from app.xml' }
+    'Word OpenXML core title' = [PSCustomObject]@{ Score = 98; Reason = 'Embedded Word OpenXML canonical document title' }
+    'Word heading title' = [PSCustomObject]@{ Score = 92; Reason = 'Word heading structure from app.xml TitlesOfParts' }
+    'RTF title control word' = [PSCustomObject]@{ Score = 96; Reason = 'Embedded RTF \\title metadata control word' }
+    'Word COM title' = [PSCustomObject]@{ Score = 90; Reason = 'Word built-in document title via COM automation' }
+    'PDF XMP title' = [PSCustomObject]@{ Score = 94; Reason = 'Embedded PDF XMP title metadata' }
+    'PDF bookmark title' = [PSCustomObject]@{ Score = 89; Reason = 'First PDF outline/bookmark title' }
+    'XML title node' = [PSCustomObject]@{ Score = 93; Reason = 'Structured XML title element' }
+    'Image embedded XMP title' = [PSCustomObject]@{ Score = 95; Reason = 'Embedded authored image title metadata' }
+    'Windows metadata title' = [PSCustomObject]@{ Score = 88; Reason = 'Windows semantic metadata title field' }
+    'Audio composite metadata' = [PSCustomObject]@{ Score = 91; Reason = 'Artist/title/album/track composite metadata' }
+    'Audio title metadata' = [PSCustomObject]@{ Score = 85; Reason = 'Audio title metadata only' }
+    'Video episode metadata' = [PSCustomObject]@{ Score = 87; Reason = 'Season/episode/media title metadata' }
+    'GPS location metadata' = [PSCustomObject]@{ Score = 80; Reason = 'Location metadata from GPS fields' }
+    'Media date metadata' = [PSCustomObject]@{ Score = 72; Reason = 'Date-based media fallback naming' }
+    'Author/company metadata' = [PSCustomObject]@{ Score = 62; Reason = 'Attribution fallback metadata' }
 }
 
 $script:LogPath = $null
@@ -375,6 +272,12 @@ $script:ResumeRenamedFrom = [System.Collections.Generic.HashSet[string]]::new([S
 $script:ResumeRenamedTo = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:EndOfLogWritten = $false
 $script:LastUsedPathStateFile = Join-Path -Path $env:APPDATA -ChildPath 'Rename-ByMetadata\last-scan-path.txt'
+# Pause before exit to allow error review
+trap {
+    Write-Host "\nERROR: $($_.Exception.Message)"
+    Read-Host "Press Enter to exit"
+    break
+}
 
 function Get-ConfidenceLevel {
     param(
@@ -470,13 +373,13 @@ function Initialize-RunLog {
         [string]$Path,
 
         [Parameter(Mandatory)]
-        [bool]$Recurse,
+        [switch]$Recurse,
 
         [Parameter(Mandatory)]
         [string]$Mode,
 
         [Parameter(Mandatory)]
-        [bool]$Admin,
+        [switch]$Admin,
 
         [string]$RequestedLogPath,
 
@@ -564,13 +467,13 @@ function Get-DiscoveredFiles {
         [string]$Root,
 
         [Parameter(Mandatory)]
-        [bool]$IncludeHidden,
+        [switch]$IncludeHidden,
 
         [Parameter(Mandatory)]
-        [bool]$Recurse,
+        [switch]$Recurse,
 
         [Parameter(Mandatory)]
-        [bool]$InteractiveSubfolders
+        [switch]$InteractiveSubfolders
     )
 
     if (-not $InteractiveSubfolders) {
@@ -1554,7 +1457,7 @@ if ($resumeRequested) {
             }
 
             if ($usePreviousSettings) {
-                $appliedSettings = Apply-SelectedSettingsFromLog -Settings $selectedSettings -BoundParameters $PSBoundParameters
+                $appliedSettings = Set-SelectedSettingsFromLog -Settings $selectedSettings -BoundParameters $PSBoundParameters
                 $resumeSettingsApplied = @($appliedSettings).Count -gt 0
                 if ($resumeSettingsApplied) {
                     Write-Host (
@@ -1581,7 +1484,7 @@ if ($retryErrorsRequested -and -not $resumeRequested) {
             }
 
             if ($applyRetrySettings) {
-                $appliedRetrySettings = Apply-SelectedSettingsFromLog -Settings $retrySettings -BoundParameters $PSBoundParameters
+                $appliedRetrySettings = Set-SelectedSettingsFromLog -Settings $retrySettings -BoundParameters $PSBoundParameters
                 $retrySettingsApplied = @($appliedRetrySettings).Count -gt 0
                 if ($retrySettingsApplied) {
                     Write-Host (
@@ -3265,118 +3168,10 @@ if (-not $isImmediateRenameMode) {
     for ($renameBatchStart = 0; $renameBatchStart -lt $totalPlanEntries; $renameBatchStart += $BatchSize) {
         $renameBatchEnd = [Math]::Min($renameBatchStart + $BatchSize - 1, $totalPlanEntries - 1)
         $currentRenameBatch = [int]([Math]::Floor($renameBatchStart / [double]$BatchSize) + 1)
-        $currentRenameBatchSize = ($renameBatchEnd - $renameBatchStart + 1)
-
         if ($totalRenameBatches -gt 1) {
-            Write-Host (
-                "Applying batch {0}/{1} ({2} renames)..." -f
-                $currentRenameBatch,
-                $totalItems = $itemsArray.Count
-                $totalItemBatches = if ($totalItems -gt 0) { [int][Math]::Ceiling($totalItems / [double]$BatchSize) } else { 0 }
-
-                # Global try/catch and batch watchdog
-                $globalBatchStartTime = Get-Date
-                $globalBatchMemoryStart = [System.GC]::GetTotalMemory($false)
-                try {
-                    for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
-                        $batchEnd = [Math]::Min($batchStart + $BatchSize - 1, $totalItems - 1)
-                        $batchStartTime = Get-Date
-                        $batchMemoryStart = [System.GC]::GetTotalMemory($false)
-                        $currentBatchNumber = [int]([Math]::Floor($batchStart / [double]$BatchSize) + 1)
-                        $currentBatchCount = ($batchEnd - $batchStart + 1)
-
-                        if ($totalItemBatches -gt 1) {
-                            Write-Host (
-                                "Processing batch {0}/{1} ({2} files)..." -f
-                                $currentBatchNumber,
-                                $totalItemBatches,
-                                $currentBatchCount
-                            ) -ForegroundColor DarkYellow
-                            Write-RunLog -Message (
-                                "BatchStart | Phase=scan | Batch={0}/{1} | Size={2} | MemoryStart={3:N0} bytes | TimeStart={4}" -f
-                                $currentBatchNumber,
-                                $totalItemBatches,
-                                $currentBatchCount,
-                                $batchMemoryStart,
-                                $batchStartTime
-                            )
-                        }
-
-                        for ($i = $batchStart; $i -le $batchEnd; $i++) {
-                            $file = $itemsArray[$i]
-                            $fileStopwatch = $null
-                            try {
-                                $activePhase = if ($isImmediateRenameMode) { 'rename' } elseif ($isApplyMode) { 'planning' } else { 'preview' }
-                                if (-not (Handle-RunControl -Phase $activePhase)) {
-                                    break
-                                }
-
-                                $scanProcessed++
-                                if (($scanProcessed % $heartbeatEvery) -eq 0) {
-                                    Write-RunLog -Message (
-                                        "HEARTBEAT | Phase=scan | Processed={0}/{1} | Candidates={2} | Renamed={3} | Skipped={4} | Errors={5} | ElapsedSeconds={6:N1}" -f
-                                        $scanProcessed,
-                                        $totalItems,
-                                        $plan.Count,
-                                        $renamed,
-                                        $skipped,
-                                        $errorCount,
-                                        $scanHeartbeatStopwatch.Elapsed.TotalSeconds
-                                    )
-                                }
-
-                                if ($script:ResumeActive -and ($script:ResumeRenamedFrom.Contains($file.FullName) -or $script:ResumeRenamedTo.Contains($file.FullName))) {
-                                    $resumeSkipped++
-                                    continue
-                                }
-                                # ...existing file processing logic...
-                            } catch {
-                                # ...existing error handling...
-                            }
-                        }
-
-                        $batchEndTime = Get-Date
-                        $batchMemoryEnd = [System.GC]::GetTotalMemory($false)
-                        $batchDuration = ($batchEndTime - $batchStartTime).TotalSeconds
-                        $batchMemoryUsed = $batchMemoryEnd - $batchMemoryStart
-
-                        Write-RunLog -Message (
-                            "BatchEnd | Phase=scan | Batch={0}/{1} | Duration={2:N1}s | MemoryUsed={3:N0} bytes | TimeEnd={4}" -f
-                            $currentBatchNumber,
-                            $totalItemBatches,
-                            $batchDuration,
-                            $batchMemoryUsed,
-                            $batchEndTime
-                        )
-
-                        if ($script:StopRequested) {
-                            break
-                        }
-
-                        if ($totalItemBatches -gt 1) {
-                            Write-RunLog -Message (
-                                "BatchComplete | Phase=scan | Batch={0}/{1}" -f
-                                $currentBatchNumber,
-                                $totalItemBatches
-                            )
-                        }
-                    }
-                } catch {
-                    $globalBatchEndTime = Get-Date
-                    $globalBatchMemoryEnd = [System.GC]::GetTotalMemory($false)
-                    $globalBatchDuration = ($globalBatchEndTime - $globalBatchStartTime).TotalSeconds
-                    $globalBatchMemoryUsed = $globalBatchMemoryEnd - $globalBatchMemoryStart
-                    Write-RunLog -Message (
-                        "GLOBAL_EXCEPTION | Phase=scan | Duration={0:N1}s | MemoryUsed={1:N0} bytes | TimeEnd={2} | Error={3}" -f
-                        $globalBatchDuration,
-                        $globalBatchMemoryUsed,
-                        $globalBatchEndTime,
-                        $_.Exception.Message
-                    )
-                    Write-Host "[FATAL] Unhandled exception in batch processing: $($_.Exception.Message)" -ForegroundColor Red
-                    Write-EndOfLogCode -Status 'Abnormal termination (unhandled exception in batch)'
-                    return
-                }
+            Write-Host ("Applying batch {0}/{1} renames..." -f $currentRenameBatch, $totalRenameBatches) -ForegroundColor DarkYellow
+            Write-RunLog -Message ("BatchStart | Phase=rename | Batch={0}/{1}" -f $currentRenameBatch, $totalRenameBatches)
+        }
     }
 
     Write-RunLog -Message (

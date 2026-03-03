@@ -1,3 +1,5 @@
+# Pause before exit to allow error review
+Read-Host "Press Enter to exit"
 # build-Rename-ByMetadata.ps1 - Builds Rename-ByMetadata.exe from Rename-ByMetadata.ps1
 
 $root = $PSScriptRoot

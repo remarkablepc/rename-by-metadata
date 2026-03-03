@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/^powershell -ExecutionPolicy Bypass -File ps2exe\\.ps1 -inputFile Rename-ByMetadata\\.ps1 -outputFile Rename-ByMetadata\\.exe$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
+		}
+	}
+}

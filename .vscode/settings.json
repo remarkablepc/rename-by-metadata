@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "git add": true,
+        "/^git commit -m \"Release v1\\.8\\.0: EXE build, error fixes, changelog, automation\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^powershell -ExecutionPolicy Bypass -File build-Rename-ByMetadata\\.ps1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
