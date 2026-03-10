@@ -1,0 +1,16 @@
+# Ignore generated reports and build artifacts
+*.log
+*.csv
+*.exe
+*.zip
+*.7z
+bin/
+obj/
+.vs/
+.vscode/
+*.user
+*.suo
+.DS_Store
+
+# Ignore local config files
+*.local.ps1

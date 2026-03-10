@@ -42,3 +42,18 @@ David Hewitt / RemarkablePC
 
 ---
 For more details, see the script header and comments.
+
+## Security & Privacy
+
+- This repository must not contain user data or generated reports. Remove or exclude any `*.log`, `*.csv`, or output files before pushing. The repository's `.gitignore` already excludes these patterns.
+- The script may read files containing personal data; always run on copies or in a controlled environment.
+
+## Installation & Requirements
+
+- Windows PowerShell (tested on PowerShell 5.1 and PowerShell 7+).
+- Microsoft Word required for some DOC/RTF extraction scenarios.
+
+## Contributing
+
+See `CONTRIBUTING.md` for guidelines on reporting issues and submitting pull requests.
+

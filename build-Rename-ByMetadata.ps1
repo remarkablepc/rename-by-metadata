@@ -1,5 +1,3 @@
-# Pause before exit to allow error review
-Read-Host "Press Enter to exit"
 # build-Rename-ByMetadata.ps1 - Builds Rename-ByMetadata.exe from Rename-ByMetadata.ps1
 
 $root = $PSScriptRoot
@@ -18,8 +16,9 @@ ps2exe `
   -company "Local Scripts" `
   -description "Metadata-driven preview-first renaming utility" `
   -version "1.0.0.0" `
-  -noConsole:$false `
-  -x64
+  -x64 `
+  -supportOS `
+  -longPaths
 
 Write-Host "EXE build complete: $out"
 Write-Host "Checking for code-signing certificate..." -ForegroundColor Yellow

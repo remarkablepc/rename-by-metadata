@@ -1,9 +1,40 @@
-# Trap any terminating error and pause before exit
-trap {
-    Write-Host "\nERROR: $($_.Exception.Message)"
-    Read-Host "Press Enter to exit"
-    break
-}
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [string]$Path,
+    [switch]$Apply,
+    [switch]$ImmediateRename,
+    [switch]$QuickPreview,
+    [int]$QuickPreviewLimit = 200,
+    [switch]$NoRecurse,
+    [switch]$InteractiveSubfolders,
+    [switch]$IncludeHidden,
+    [switch]$Force,
+    [switch]$OnlyGeneric,
+    [string]$ReportPath,
+    [string]$CsvPath,
+    [string]$LogPath,
+    [switch]$Resume,
+    [string]$ResumeLogPath,
+    [switch]$RetryErrors,
+    [string]$RetryErrorsLogPath,
+    [switch]$IntelligentScan,
+    [switch]$IncludeOtherFiles,
+    [switch]$ScanOtherFilesAtEnd,
+    [switch]$ListUncommonFiles,
+    [switch]$NoAutoResumePrompt,
+    [bool]$SkipLikelyAlreadyRenamed = $true,
+    [int]$PerFileTimeoutSeconds = 20,
+    [int]$BatchSize = 500,
+    [switch]$SkipMetadataUpgrade,
+    [switch]$Unattended,
+    [switch]$UseWordCom,
+    [int]$MaxFileReadMB = 50,
+    [int]$ComRecycleInterval = 200,
+    [switch]$BackfillRenameSuffix,
+    [string]$BackfillLogPath,
+    [switch]$Help,
+    [switch]$DebugOutput
+)
 
 <#
 .SYNOPSIS
@@ -241,16 +272,19 @@ Use -Path to specify the scan root for this script version.
 #>
 
 # Script-wide confidence score matrix
-$null = $true # test assignment to confirm parsing
-
 $script:ScoreMatrix = @{
     'DOCX core title' = [PSCustomObject]@{ Score = 98; Reason = 'Embedded canonical document title' }
     'DOCX heading title' = [PSCustomObject]@{ Score = 92; Reason = 'Document heading structure from app.xml' }
     'Word OpenXML core title' = [PSCustomObject]@{ Score = 98; Reason = 'Embedded Word OpenXML canonical document title' }
     'Word heading title' = [PSCustomObject]@{ Score = 92; Reason = 'Word heading structure from app.xml TitlesOfParts' }
+    'PPTX core title' = [PSCustomObject]@{ Score = 97; Reason = 'Embedded PowerPoint OpenXML document title' }
+    'PPTX heading title' = [PSCustomObject]@{ Score = 91; Reason = 'PowerPoint heading from app.xml TitlesOfParts' }
+    'XLSX core title' = [PSCustomObject]@{ Score = 96; Reason = 'Embedded Excel OpenXML document title' }
+    'XLSX heading title' = [PSCustomObject]@{ Score = 90; Reason = 'Excel heading from app.xml TitlesOfParts' }
     'RTF title control word' = [PSCustomObject]@{ Score = 96; Reason = 'Embedded RTF \\title metadata control word' }
     'Word COM title' = [PSCustomObject]@{ Score = 90; Reason = 'Word built-in document title via COM automation' }
     'PDF XMP title' = [PSCustomObject]@{ Score = 94; Reason = 'Embedded PDF XMP title metadata' }
+    'PDF Info title' = [PSCustomObject]@{ Score = 92; Reason = 'PDF /Info dictionary /Title field' }
     'PDF bookmark title' = [PSCustomObject]@{ Score = 89; Reason = 'First PDF outline/bookmark title' }
     'XML title node' = [PSCustomObject]@{ Score = 93; Reason = 'Structured XML title element' }
     'Image embedded XMP title' = [PSCustomObject]@{ Score = 95; Reason = 'Embedded authored image title metadata' }
@@ -260,8 +294,9 @@ $script:ScoreMatrix = @{
     'Video episode metadata' = [PSCustomObject]@{ Score = 87; Reason = 'Season/episode/media title metadata' }
     'GPS location metadata' = [PSCustomObject]@{ Score = 80; Reason = 'Location metadata from GPS fields' }
     'Media date metadata' = [PSCustomObject]@{ Score = 72; Reason = 'Date-based media fallback naming' }
-    'Author/company metadata' = [PSCustomObject]@{ Score = 62; Reason = 'Attribution fallback metadata' }
+	'Author/company metadata' = [PSCustomObject]@{ Score = 62; Reason = 'Attribution fallback metadata' }
 }
+
 
 $script:LogPath = $null
 $script:StopRequested = $false
@@ -270,14 +305,44 @@ $script:ResumeActive = $false
 $script:ResumeLogSource = $null
 $script:ResumeRenamedFrom = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:ResumeRenamedTo = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:ResumeRenamedScores = [System.Collections.Generic.Dictionary[string,PSCustomObject]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:EndOfLogWritten = $false
 $script:LastUsedPathStateFile = Join-Path -Path $env:APPDATA -ChildPath 'Rename-ByMetadata\last-scan-path.txt'
-# Pause before exit to allow error review
-trap {
-    Write-Host "\nERROR: $($_.Exception.Message)"
-    Read-Host "Press Enter to exit"
-    break
+$script:UnattendedMode = $false
+$script:MaxFileReadBytes = 50 * 1024 * 1024
+$script:ComRecycleInterval = 200
+$script:NoWordComMode = $true
+$script:OriginalWindowTitle = $null
+
+function Update-WindowTitle {
+    param(
+        [string]$Phase,
+        [int]$Processed,
+        [int]$Total,
+        [int]$Renamed,
+        [int]$Errors,
+        [double]$ElapsedSeconds
+    )
+
+    $elapsed = [TimeSpan]::FromSeconds($ElapsedSeconds)
+    $elapsedText = if ($elapsed.TotalHours -ge 1) {
+        '{0:N0}h {1:N0}m' -f [Math]::Floor($elapsed.TotalHours), $elapsed.Minutes
+    } else {
+        '{0:N0}m {1:N0}s' -f [Math]::Floor($elapsed.TotalMinutes), $elapsed.Seconds
+    }
+
+    $pct = if ($Total -gt 0) { [int](($Processed / $Total) * 100) } else { 0 }
+    $title = '[Rename-{0}] {1}/{2} ({3}%) | Renamed:{4} Err:{5} | {6}' -f $Phase, $Processed, $Total, $pct, $Renamed, $Errors, $elapsedText
+
+    try { $host.UI.RawUI.WindowTitle = $title } catch {}
 }
+
+function Restore-WindowTitle {
+    if (-not [string]::IsNullOrWhiteSpace($script:OriginalWindowTitle)) {
+        try { $host.UI.RawUI.WindowTitle = $script:OriginalWindowTitle } catch {}
+    }
+}
+
 
 function Get-ConfidenceLevel {
     param(
@@ -440,6 +505,10 @@ function Read-YesNo {
         [bool]$DefaultYes = $true
     )
 
+    if ($script:UnattendedMode) {
+        return $DefaultYes
+    }
+
     $suffix = if ($DefaultYes) { '[Y/n]' } else { '[y/N]' }
 
     while ($true) {
@@ -537,17 +606,56 @@ function Test-RunControl {
         return $false
     }
 
+    if ($script:UnattendedMode) {
+        return $true
+    }
+
     try {
+        $consoleAvailable = $false
+        try { $null = [Console]::KeyAvailable; $consoleAvailable = $true } catch { $consoleAvailable = $false }
+        if (-not $consoleAvailable) {
+            # Fallback: prompt user for action
+            $input = Read-Host "Type P to pause, S to stop, or Enter to continue ($Phase phase)"
+            switch ($input.Trim().ToUpperInvariant()) {
+                'P' {
+                    Write-Host ("Paused during {0}. Type C to continue or S to stop." -f $Phase) -ForegroundColor Yellow
+                    Write-RunLog -Message ("Paused during {0} phase by fallback prompt." -f $Phase)
+                    while ($true) {
+                        $resumeInput = Read-Host "Type C to continue or S to stop ($Phase phase)"
+                        switch ($resumeInput.Trim().ToUpperInvariant()) {
+                            'C' {
+                                Write-Host ("Resuming {0}..." -f $Phase) -ForegroundColor Green
+                                Write-RunLog -Message ("Resumed {0} phase by fallback prompt." -f $Phase)
+                                return $true
+                            }
+                            'S' {
+                                $script:StopRequested = $true
+                                Write-Host ("Stop requested during paused {0} phase. Ending run gracefully..." -f $Phase) -ForegroundColor Yellow
+                                Write-RunLog -Message ("Stop requested during paused {0} phase by fallback prompt." -f $Phase)
+                                return $false
+                            }
+                            default { continue }
+                        }
+                    }
+                }
+                'S' {
+                    $script:StopRequested = $true
+                    Write-Host ("Stop requested during {0} phase. Ending run gracefully..." -f $Phase) -ForegroundColor Yellow
+                    Write-RunLog -Message ("Stop requested during {0} phase by fallback prompt." -f $Phase)
+                    return $false
+                }
+                default { return $true }
+            }
+        }
+        # Console available: use hotkeys
         if (-not [Console]::KeyAvailable) {
             return $true
         }
-
         $key = [Console]::ReadKey($true)
         switch ($key.Key) {
             'P' {
                 Write-Host ("Paused during {0}. Press C to continue or S to stop." -f $Phase) -ForegroundColor Yellow
                 Write-RunLog -Message ("Paused during {0} phase by user hotkey." -f $Phase)
-
                 while ($true) {
                     $resumeKey = [Console]::ReadKey($true)
                     switch ($resumeKey.Key) {
@@ -562,9 +670,7 @@ function Test-RunControl {
                             Write-RunLog -Message ("Stop requested during paused {0} phase by user hotkey." -f $Phase)
                             return $false
                         }
-                        default {
-                            continue
-                        }
+                        default { continue }
                     }
                 }
             }
@@ -574,9 +680,7 @@ function Test-RunControl {
                 Write-RunLog -Message ("Stop requested during {0} phase by user hotkey." -f $Phase)
                 return $false
             }
-            default {
-                return $true
-            }
+            default { return $true }
         }
     }
     catch {
@@ -690,7 +794,7 @@ function New-MetadataNameResult {
         }
     }
 
-    $cleanName = Normalize-MetadataTitle -Title $Name
+    $cleanName = ConvertTo-NormalizedMetadataTitle -Title $Name
     if ([string]::IsNullOrWhiteSpace($cleanName)) {
         return $null
     }
@@ -814,11 +918,19 @@ function Resolve-ResumeLogPath {
     }
 
     try {
-        $candidate = Get-ChildItem -LiteralPath $Root -File -Filter 'Rename-Run-*.log' -ErrorAction Stop |
+        $candidates = Get-ChildItem -LiteralPath $Root -File -Filter 'Rename-Run-*.log' -ErrorAction Stop |
             Sort-Object LastWriteTimeUtc -Descending |
-            Select-Object -First 1
-        if ($candidate) {
-            return $candidate.FullName
+            Select-Object -First 10
+        foreach ($candidate in $candidates) {
+            # Skip empty/zero-rename logs that completed normally — they have no useful resume data
+            $quickCheck = Get-ResumeCandidateStatus -Path $candidate.FullName
+            if ($quickCheck.Eligible -or $quickCheck.StructuredRenamedEntries -gt 0) {
+                return $candidate.FullName
+            }
+        }
+        # Fall back to the most recent log if none had rename data
+        if ($candidates) {
+            return $candidates[0].FullName
         }
     }
     catch {
@@ -964,11 +1076,22 @@ function Import-ResumeStateFromLog {
         return $state
     }
 
-    $pattern = 'RENAMED\b.*\|\s*From=(?<from>.+?)\s*\|\s*To=(?<to>.+?)\s*$'
+    $pattern = 'RENAMED\b\s*\[(?:[^/]+)/(?<score>\d+)%?\].*?\[(?<source>[^\]]+)\].*\|\s*From=(?<from>.+?)\s*\|\s*To=(?<to>.+?)\s*$'
+    $fallbackPattern = 'RENAMED\b.*\|\s*From=(?<from>.+?)\s*\|\s*To=(?<to>.+?)\s*$'
 
     try {
         foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
-            if ($line -notmatch $pattern) {
+            $score = $null
+            $source = $null
+
+            if ($line -match $pattern) {
+                $score = [int]$Matches['score']
+                $source = $Matches['source'].Trim()
+            }
+            elseif ($line -match $fallbackPattern) {
+                # Older log format without parseable score
+            }
+            else {
                 continue
             }
 
@@ -980,6 +1103,9 @@ function Import-ResumeStateFromLog {
             }
             if (-not [string]::IsNullOrWhiteSpace($toPath)) {
                 $null = $script:ResumeRenamedTo.Add($toPath)
+                if ($null -ne $score) {
+                    $script:ResumeRenamedScores[$toPath] = [PSCustomObject]@{ Score = $score; Source = $source }
+                }
             }
         }
     }
@@ -1058,6 +1184,29 @@ function Convert-LogSettingToBool {
     }
 }
 
+function Convert-LogSettingToInt {
+    param(
+        [string]$Value,
+
+        [int]$Default = 0,
+
+        [int]$Max = [int]::MaxValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $Default
+    }
+
+    $parsed = 0
+    if ([int]::TryParse($Value.ToString().Trim(), [ref]$parsed)) {
+        if ($parsed -ge 1 -and $parsed -le $Max) {
+            return $parsed
+        }
+    }
+
+    return $Default
+}
+
 function Set-SelectedSettingsFromLog {
     param(
         [Parameter(Mandatory)]
@@ -1090,8 +1239,8 @@ function Set-SelectedSettingsFromLog {
 
     if (-not $BoundParameters.ContainsKey('QuickPreviewLimit') -and $Settings.Contains('QuickPreviewLimit')) {
         $limitRaw = $Settings['QuickPreviewLimit']
-        $parsedLimit = 0
-        if (-not [string]::IsNullOrWhiteSpace($limitRaw) -and $limitRaw -ne 'N/A' -and [int]::TryParse($limitRaw, [ref]$parsedLimit) -and $parsedLimit -ge 1 -and $parsedLimit -le 100000) {
+        $parsedLimit = Convert-LogSettingToInt -Value $limitRaw -Default 200 -Max 1000000
+        if ($parsedLimit -ge 1 -and $parsedLimit -le 1000000) {
             $script:QuickPreviewLimit = $parsedLimit
             $appliedKeys.Add('QuickPreviewLimit') | Out-Null
         }
@@ -1127,6 +1276,11 @@ function Set-SelectedSettingsFromLog {
         $appliedKeys.Add('IntelligentScan') | Out-Null
     }
 
+    if ($Settings.Contains('UseExtensionFolders')) {
+        $script:UseExtensionFolders = Convert-LogSettingToBool -Value $Settings['UseExtensionFolders'] -Default $false
+        $appliedKeys.Add('UseExtensionFolders') | Out-Null
+    }
+
     if (-not $BoundParameters.ContainsKey('IncludeOtherFiles') -and $Settings.Contains('IncludeOtherFiles')) {
         $script:IncludeOtherFiles = Convert-LogSettingToBool -Value $Settings['IncludeOtherFiles'] -Default $false
         $appliedKeys.Add('IncludeOtherFiles') | Out-Null
@@ -1143,14 +1297,14 @@ function Set-SelectedSettingsFromLog {
     }
 
     if (-not $BoundParameters.ContainsKey('SkipLikelyAlreadyRenamed') -and $Settings.Contains('SkipLikelyAlreadyRenamed')) {
-        $script:SkipLikelyAlreadyRenamed = Convert-LogSettingToBool -Value $Settings['SkipLikelyAlreadyRenamed'] -Default $false
+        $script:SkipLikelyAlreadyRenamed = Convert-LogSettingToBool -Value $Settings['SkipLikelyAlreadyRenamed'] -Default $true
         $appliedKeys.Add('SkipLikelyAlreadyRenamed') | Out-Null
     }
 
     if (-not $BoundParameters.ContainsKey('PerFileTimeoutSeconds') -and $Settings.Contains('PerFileTimeoutSeconds')) {
         $timeoutRaw = $Settings['PerFileTimeoutSeconds']
-        $parsedTimeout = 0
-        if (-not [string]::IsNullOrWhiteSpace($timeoutRaw) -and [int]::TryParse($timeoutRaw, [ref]$parsedTimeout) -and $parsedTimeout -ge 5 -and $parsedTimeout -le 600) {
+        $parsedTimeout = Convert-LogSettingToInt -Value $timeoutRaw -Default 20 -Max 600
+        if ($parsedTimeout -ge 5 -and $parsedTimeout -le 600) {
             $script:PerFileTimeoutSeconds = $parsedTimeout
             $appliedKeys.Add('PerFileTimeoutSeconds') | Out-Null
         }
@@ -1233,7 +1387,8 @@ function Test-LikelyAlreadyRenamedName {
     $patterns = @(
         '^(Audio|Video|Photo|Document)\s+\d{4}-\d{2}-\d{2}(?:\s+\d{2}-\d{2}(?:-\d{2})?)?(?:\s+\(\d+\))?$',
         '.*\s+\(\d+\)$',
-        '^(Location\s+.+|.+\s+-\s+Location\s+.+)$'
+        '^(Location\s+.+|.+\s+-\s+Location\s+.+)$',
+        '.*_renamed(?:\s+\(\d+\))?$'
     )
 
     foreach ($pattern in $patterns) {
@@ -1326,7 +1481,8 @@ function Show-CommandLineHelp {
     Write-Host '               [-ReportPath <txt>] [-CsvPath <csv>] [-LogPath <log>]'
     Write-Host '               [-Resume] [-ResumeLogPath <log>] [-RetryErrors] [-RetryErrorsLogPath <log>]'
     Write-Host '               [-IntelligentScan] [-IncludeOtherFiles] [-ScanOtherFilesAtEnd] [-ListUncommonFiles] [-NoAutoResumePrompt]'
-    Write-Host '               [-SkipLikelyAlreadyRenamed] [-PerFileTimeoutSeconds <5-600>] [-BatchSize <100-50000>]'
+    Write-Host '               [-SkipLikelyAlreadyRenamed <$true/$false>] [-PerFileTimeoutSeconds <5-600>] [-BatchSize <100-50000>]'
+    Write-Host '               [-Unattended] [-UseWordCom] [-MaxFileReadMB <1-500>] [-ComRecycleInterval <50-10000>]'
     Write-Host ''
     Write-Host 'EXE help shortcuts:' -ForegroundColor Yellow
     Write-Host ("  .\{0} /?" -f $exeName)
@@ -1337,6 +1493,13 @@ function Show-CommandLineHelp {
     Write-Host ("  .\{0} -Path `"D:\Reconstructed`" -Apply" -f $scriptName)
     Write-Host ("  .\{0} -Path `"D:\Reconstructed`" -QuickPreview -QuickPreviewLimit 50" -f $scriptName)
     Write-Host ("  .\{0} -Path `"D:\Reconstructed`" -BatchSize 500" -f $scriptName)
+    Write-Host ''
+    Write-Host 'Unattended weekend run (hardened, no prompts):' -ForegroundColor Yellow
+    Write-Host ("  .\{0} -Path `"D:\CarolynR\Reconstructed`" -Apply -ImmediateRename -Resume -NoAutoResumePrompt -IntelligentScan -Unattended" -f $scriptName)
+    Write-Host ''
+    Write-Host 'Notes:' -ForegroundColor DarkGray
+    Write-Host '  Word COM is disabled by default (freeze-prone). Use -UseWordCom to opt back in.' -ForegroundColor DarkGray
+    Write-Host '  Already-renamed file skipping is on by default. Use -SkipLikelyAlreadyRenamed:$false to disable.' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -1378,6 +1541,71 @@ if ($Help -or $pathLooksLikeHelp -or $rawArgsContainSlashHelp -or $commandLineCo
     return
 }
 
+# --- BackfillRenameSuffix: add _renamed to files from a prior run log ---
+if ($BackfillRenameSuffix) {
+    $backfillLog = $BackfillLogPath
+    if ([string]::IsNullOrWhiteSpace($backfillLog) -and -not [string]::IsNullOrWhiteSpace($Path)) {
+        $backfillLog = (Resolve-ResumeLogPath -Root (Resolve-Path -LiteralPath $Path).Path -RequestedPath $null)
+    }
+    if ([string]::IsNullOrWhiteSpace($backfillLog) -or -not (Test-Path -LiteralPath $backfillLog)) {
+        Write-Host 'BackfillRenameSuffix: No log file found. Use -BackfillLogPath to specify one.' -ForegroundColor Red
+        return
+    }
+    Write-Host ("Backfilling _renamed suffix from log: {0}" -f $backfillLog) -ForegroundColor Cyan
+    $pattern = 'RENAMED\b.*\|\s*To=(?<to>.+?)\s*$'
+    $backfillRenamed = 0
+    $backfillSkipped = 0
+    $backfillMissing = 0
+    foreach ($line in (Get-Content -LiteralPath $backfillLog -Encoding UTF8)) {
+        if ($line -match $pattern) {
+            $toPath = $Matches['to']
+            if (-not (Test-Path -LiteralPath $toPath)) {
+                $backfillMissing++
+                continue
+            }
+            $toBase = [System.IO.Path]::GetFileNameWithoutExtension($toPath)
+            $toExt  = [System.IO.Path]::GetExtension($toPath)
+            if ($toBase -match '_renamed(\s+\(\d+\))?$') {
+                $backfillSkipped++
+                continue
+            }
+            $newBase = $toBase + '_renamed'
+            $dir = [System.IO.Path]::GetDirectoryName($toPath)
+            $candidate = Join-Path $dir ($newBase + $toExt)
+            $counter = 1
+            while (Test-Path -LiteralPath $candidate) {
+                $candidate = Join-Path $dir ("{0} ({1}){2}" -f $newBase, $counter, $toExt)
+                $counter++
+            }
+            $newName = [System.IO.Path]::GetFileName($candidate)
+            if ($PSCmdlet.ShouldProcess($toPath, "Backfill rename to '$newName'")) {
+                try {
+                    Rename-Item -LiteralPath $toPath -NewName $newName -ErrorAction Stop
+                    $backfillRenamed++
+                }
+                catch {
+                    Write-Host ("  ERROR backfilling {0}: {1}" -f $toPath, $_.Exception.Message) -ForegroundColor Red
+                }
+            }
+        }
+    }
+    Write-Host ("Backfill complete. Renamed: {0} | AlreadySuffixed: {1} | Missing: {2}" -f $backfillRenamed, $backfillSkipped, $backfillMissing) -ForegroundColor Green
+    return
+}
+
+# Initialize hardening modes from parameters
+if ($Unattended) {
+    $script:UnattendedMode = $true
+    Write-Host 'Unattended mode enabled. All interactive prompts will auto-answer with defaults.' -ForegroundColor Yellow
+}
+if ($UseWordCom) {
+    $script:NoWordComMode = $false
+    Write-Host 'Word COM automation enabled by -UseWordCom. This may cause hangs on corrupt files.' -ForegroundColor Yellow
+}
+$script:MaxFileReadBytes = [long]$MaxFileReadMB * 1024 * 1024
+$script:ComRecycleInterval = $ComRecycleInterval
+$script:PerFileTimeoutSeconds = $PerFileTimeoutSeconds
+
 $retryErrorsRequested = $RetryErrors.IsPresent -or -not [string]::IsNullOrWhiteSpace($RetryErrorsLogPath)
 
 $defaultPath = Get-LastUsedScanPath
@@ -1386,12 +1614,16 @@ if ([string]::IsNullOrWhiteSpace($defaultPath)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Path)) {
+    if ($script:UnattendedMode) {
+        $Path = $defaultPath
+    } else {
     $enteredPath = Read-Host "Enter folder path to scan (press Enter for default: $defaultPath)"
     if ([string]::IsNullOrWhiteSpace($enteredPath)) {
         $Path = $defaultPath
     }
     else {
         $Path = $enteredPath.Trim()
+    }
     }
 }
 
@@ -1428,12 +1660,15 @@ $retrySettingsApplied = $false
 if (-not $resumeRequested -and -not $NoAutoResumePrompt.IsPresent) {
     if (-not [string]::IsNullOrWhiteSpace($latestRunLog)) {
         $candidateStatus = if ($latestRunLogStatus) { $latestRunLogStatus } else { Get-ResumeCandidateStatus -Path $latestRunLog }
-        if ($candidateStatus.Eligible) {
-            $resumePrompt = Read-YesNo -Prompt (
-                "Previous run appears interrupted ({0} completed renames). Resume from '{1}'?" -f
-                $candidateStatus.StructuredRenamedEntries,
-                $latestRunLog
-            ) -DefaultYes $true
+        if ($candidateStatus.Exists) {
+            if ($candidateStatus.Eligible) {
+                $promptMsg = "Previous run appears interrupted ({0} completed renames). Resume from '{1}'?" -f $candidateStatus.StructuredRenamedEntries, $latestRunLog
+            }
+            else {
+                $promptMsg = "Previous run log found ({0} completed renames). Resume from '{1}'?" -f $candidateStatus.StructuredRenamedEntries, $latestRunLog
+            }
+
+            $resumePrompt = Read-YesNo -Prompt ($promptMsg) -DefaultYes $true
 
             if ($resumePrompt) {
                 $resumeRequested = $true
@@ -1449,12 +1684,37 @@ if ($resumeRequested) {
     if (-not [string]::IsNullOrWhiteSpace($resolvedResumeSettingsLog)) {
         $selectedSettings = Import-SelectedSettingsFromLog -Path $resolvedResumeSettingsLog
         if ($selectedSettings.Count -gt 0) {
-            $usePreviousSettings = $true
-            if ($resumeRequestedViaPrompt) {
-                $usePreviousSettings = Read-YesNo -Prompt (
-                    "Resume log includes previous job settings. Continue with those settings?" 
-                ) -DefaultYes $true
+            # Display previous settings so the user can decide whether to keep them
+            Write-Host ''
+            Write-Host 'Previous run settings:' -ForegroundColor Cyan
+
+            # Show human-readable scan mode summary
+            $scanModeLabel = 'All files (no filtering)'
+            if ($selectedSettings.Contains('UseExtensionFolders') -and (Convert-LogSettingToBool -Value $selectedSettings['UseExtensionFolders'] -Default $false)) {
+                $scanModeLabel = 'Folder names as extensions'
             }
+            elseif ($selectedSettings.Contains('IncludeOtherFiles') -and (Convert-LogSettingToBool -Value $selectedSettings['IncludeOtherFiles'] -Default $false)) {
+                $scanModeLabel = 'All files (including uncommon types)'
+            }
+            elseif ($selectedSettings.Contains('IntelligentScan') -and (Convert-LogSettingToBool -Value $selectedSettings['IntelligentScan'] -Default $false)) {
+                $endScan = $selectedSettings.Contains('ScanOtherFilesAtEnd') -and (Convert-LogSettingToBool -Value $selectedSettings['ScanOtherFilesAtEnd'] -Default $false)
+                $scanModeLabel = if ($endScan) { 'Intelligent scan + uncommon at end' } else { 'Intelligent scan (common files only)' }
+            }
+            Write-Host ("  Scan mode: {0}" -f $scanModeLabel) -ForegroundColor Gray
+
+            # Show remaining key settings
+            $skipKeys = @('IntelligentScan', 'UseExtensionFolders', 'IncludeOtherFiles', 'ScanOtherFilesAtEnd',
+                          'ResumeRequested', 'ResumeActive', 'ResumeLogPath', 'RetryErrorsRequested',
+                          'RetryErrorsActive', 'RetryErrorsLogPath', 'ReportPath', 'CsvPath', 'RequestedLogPath')
+            foreach ($k in $selectedSettings.Keys) {
+                if ($k -in $skipKeys) { continue }
+                Write-Host ("  {0}: {1}" -f $k, $selectedSettings[$k]) -ForegroundColor DarkGray
+            }
+            Write-Host ''
+
+            $usePreviousSettings = Read-YesNo -Prompt (
+                "Keep these settings? (No = choose new settings, resume data is kept either way)"
+            ) -DefaultYes $true
 
             if ($usePreviousSettings) {
                 $appliedSettings = Set-SelectedSettingsFromLog -Settings $selectedSettings -BoundParameters $PSBoundParameters
@@ -1466,6 +1726,9 @@ if ($resumeRequested) {
                         $resolvedResumeSettingsLog
                     ) -ForegroundColor Yellow
                 }
+            }
+            else {
+                Write-Host 'Previous settings declined. You will be prompted for new settings.' -ForegroundColor Yellow
             }
         }
     }
@@ -1500,7 +1763,7 @@ if ($retryErrorsRequested -and -not $resumeRequested) {
 
 $logSettingsApplied = $resumeSettingsApplied -or $retrySettingsApplied
 
-if ($InteractiveSubfolders.IsPresent -and $NoRecurse.IsPresent) {
+if ($InteractiveSubfolders -and $NoRecurse) {
     throw 'Cannot use -InteractiveSubfolders together with -NoRecurse.'
 }
 
@@ -1522,7 +1785,7 @@ if ($ImmediateRename -and -not $Apply) {
     throw 'Cannot use -ImmediateRename unless apply mode is selected.'
 }
 
-if ($IncludeOtherFiles.IsPresent -and $ScanOtherFilesAtEnd.IsPresent) {
+if ($IncludeOtherFiles -and $ScanOtherFilesAtEnd) {
     throw 'Cannot combine -IncludeOtherFiles with -ScanOtherFilesAtEnd.'
 }
 
@@ -1530,6 +1793,9 @@ $isApplyMode = [bool]$Apply
 $isImmediateRenameMode = $isApplyMode -and [bool]$ImmediateRename
 
 if (-not $PSBoundParameters.ContainsKey('QuickPreview') -and -not $logSettingsApplied) {
+    if ($script:UnattendedMode) {
+        $QuickPreview = $false
+    } else {
     $useQuickPreview = Read-YesNo -Prompt 'Use quick preview sample mode?' -DefaultYes $true
     if ($useQuickPreview) {
         $QuickPreview = $true
@@ -1550,6 +1816,7 @@ if (-not $PSBoundParameters.ContainsKey('QuickPreview') -and -not $logSettingsAp
     else {
         $QuickPreview = $false
     }
+    }
 }
 
 $intelligentScanEnabled = [bool]$IntelligentScan
@@ -1564,8 +1831,31 @@ if ($includeOtherFilesNow) {
 
 
 # Add a new autodiscovery mode: F = Use folder names as extensions
-$useExtensionFolders = $false
-if (-not $retryErrorsRequested -and -not $PSBoundParameters.ContainsKey('IntelligentScan') -and -not $PSBoundParameters.ContainsKey('IncludeOtherFiles') -and -not $logSettingsApplied) {
+$useExtensionFolders = if ($logSettingsApplied -and $script:UseExtensionFolders) { $true } else { $false }
+
+# If extension-folder mode was restored from prior settings but the current root
+# contains no matching extension-named subfolders, confirm with the user before
+# continuing; default to NO to avoid an empty scan.
+if ($useExtensionFolders -and $logSettingsApplied) {
+    $commonExtFolders = @(
+        'doc','docx','docm','dot','dotx','dotm','pdf','ppt','pptx','xls','xlsx','rtf','odt','ods','odp','xml',
+        'jpg','jpeg','jfif','png','heic','tif','tiff','gif','bmp','webp','raw','cr2','nef','arw','dng','ico','avif',
+        'mp3','wav','flac','aac','m4a','ogg','wma','aiff','alac','opus',
+        'mp4','mov','m4v','avi','mkv','wmv','flv','webm','mpg','mpeg','3gp','mts','m2ts','ts'
+    )
+    try {
+        $foundExtFolders = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $commonExtFolders -contains $_.Name.ToLowerInvariant() }
+    } catch { $foundExtFolders = @() }
+
+    if (-not $foundExtFolders -or $foundExtFolders.Count -eq 0) {
+        $confirmExtMode = Read-YesNo -Prompt ("No extension-named subfolders found in '{0}'. Continue with folder-name-as-extension scan?" -f $root) -DefaultYes $false
+        if (-not $confirmExtMode) { $useExtensionFolders = $false }
+    }
+}
+if ($script:UnattendedMode -and -not $PSBoundParameters.ContainsKey('IntelligentScan') -and -not $PSBoundParameters.ContainsKey('IncludeOtherFiles') -and -not $logSettingsApplied) {
+    $intelligentScanEnabled = $true
+    $useExtensionFolders = $false
+} elseif (-not $retryErrorsRequested -and -not $PSBoundParameters.ContainsKey('IntelligentScan') -and -not $PSBoundParameters.ContainsKey('IncludeOtherFiles') -and -not $logSettingsApplied) {
     while ($true) {
         $scanPrompt = Read-Host 'File type scan mode: [Y]es (intelligent scan), [N]o (all files), or [F]older names as extensions? [Y/n/f]'
         if ([string]::IsNullOrWhiteSpace($scanPrompt)) { $scanPrompt = 'y' }
@@ -1592,7 +1882,10 @@ if ($useExtensionFolders) {
     }
 
     if (-not $PSBoundParameters.ContainsKey('NoRecurse') -and -not $logSettingsApplied) {
-        if (-not $PSBoundParameters.ContainsKey('InteractiveSubfolders')) {
+        if ($script:UnattendedMode) {
+            $NoRecurse = $false
+            $InteractiveSubfolders = $false
+        } elseif (-not $PSBoundParameters.ContainsKey('InteractiveSubfolders')) {
             :SubfolderModePrompt while ($true) {
                 $subfolderMode = Read-Host 'Subfolder scan mode: [Y]es all, [N]o, or [I]nteractive per folder? [Y/n/i]'
 
@@ -1640,7 +1933,7 @@ if ($useExtensionFolders) {
     }
 }
 
-if ($InteractiveSubfolders.IsPresent) {
+if ($InteractiveSubfolders) {
     $NoRecurse = $false
 }
 
@@ -1659,12 +1952,12 @@ if ($wantsAdmin -and -not $isAdmin) {
     $argsList.Add(('"{0}"' -f $Path)) | Out-Null
 
     if ($NoRecurse) { $argsList.Add('-NoRecurse') | Out-Null }
-    if ($InteractiveSubfolders.IsPresent) { $argsList.Add('-InteractiveSubfolders') | Out-Null }
-    if ($IncludeHidden.IsPresent) { $argsList.Add('-IncludeHidden') | Out-Null }
-    if ($Force.IsPresent) { $argsList.Add('-Force') | Out-Null }
-    if ($OnlyGeneric.IsPresent) { $argsList.Add('-OnlyGeneric') | Out-Null }
-    if ($Apply.IsPresent) { $argsList.Add('-Apply') | Out-Null }
-    if ($ImmediateRename.IsPresent) { $argsList.Add('-ImmediateRename') | Out-Null }
+    if ($InteractiveSubfolders) { $argsList.Add('-InteractiveSubfolders') | Out-Null }
+    if ($IncludeHidden) { $argsList.Add('-IncludeHidden') | Out-Null }
+    if ($Force) { $argsList.Add('-Force') | Out-Null }
+    if ($OnlyGeneric) { $argsList.Add('-OnlyGeneric') | Out-Null }
+    if ($Apply) { $argsList.Add('-Apply') | Out-Null }
+    if ($ImmediateRename) { $argsList.Add('-ImmediateRename') | Out-Null }
     if ($QuickPreview) {
         $argsList.Add('-QuickPreview') | Out-Null
         $argsList.Add('-QuickPreviewLimit') | Out-Null
@@ -1692,8 +1985,18 @@ if ($wantsAdmin -and -not $isAdmin) {
     if ($NoAutoResumePrompt.IsPresent) {
         $argsList.Add('-NoAutoResumePrompt') | Out-Null
     }
-    if ($SkipLikelyAlreadyRenamed.IsPresent) {
+    if ($SkipLikelyAlreadyRenamed) {
         $argsList.Add('-SkipLikelyAlreadyRenamed') | Out-Null
+        $argsList.Add('$true') | Out-Null
+    } else {
+        $argsList.Add('-SkipLikelyAlreadyRenamed') | Out-Null
+        $argsList.Add('$false') | Out-Null
+    }
+    if ($SkipMetadataUpgrade) {
+        $argsList.Add('-SkipMetadataUpgrade') | Out-Null
+    }
+    if ($UseWordCom) {
+        $argsList.Add('-UseWordCom') | Out-Null
     }
     if ($PSBoundParameters.ContainsKey('BatchSize')) {
         $argsList.Add('-BatchSize') | Out-Null
@@ -1727,6 +2030,11 @@ function Get-UniqueTargetPath {
         $ReservedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     }
 
+    # Append _renamed suffix so files are identifiable even without the log
+    if ($BaseName -notmatch '_renamed$') {
+        $BaseName = $BaseName + '_renamed'
+    }
+
     $candidate = Join-Path $Directory ($BaseName + $Extension)
 
     if (($candidate -ieq $CurrentFullName) -and -not $ReservedPaths.Contains($candidate)) {
@@ -1734,11 +2042,26 @@ function Get-UniqueTargetPath {
         return $candidate
     }
 
-    $counter = 1
-    while ((Test-Path -LiteralPath $candidate) -or $ReservedPaths.Contains($candidate)) {
-        $candidate = Join-Path $Directory ("{0} ({1}){2}" -f $BaseName, $counter, $Extension)
-        $counter++
+    # Use a shared counter dictionary to skip O(n) probing for repeated base names
+    if ($null -eq $script:_uniquePathCounters) {
+        $script:_uniquePathCounters = [System.Collections.Generic.Dictionary[string,int]]::new([System.StringComparer]::OrdinalIgnoreCase)
     }
+    $counterKey = (Join-Path $Directory ($BaseName + $Extension))
+    $counter = 1
+    if ($script:_uniquePathCounters.ContainsKey($counterKey)) {
+        $counter = $script:_uniquePathCounters[$counterKey]
+    }
+    if (-not ((Test-Path -LiteralPath $candidate) -or $ReservedPaths.Contains($candidate))) {
+        # Base name (no counter) is available
+    }
+    else {
+        $candidate = Join-Path $Directory ("{0} ({1}){2}" -f $BaseName, $counter, $Extension)
+        while ((Test-Path -LiteralPath $candidate) -or $ReservedPaths.Contains($candidate)) {
+            $counter++
+            $candidate = Join-Path $Directory ("{0} ({1}){2}" -f $BaseName, $counter, $Extension)
+        }
+    }
+    $script:_uniquePathCounters[$counterKey] = $counter + 1
 
     $null = $ReservedPaths.Add($candidate)
     return $candidate
@@ -1846,6 +2169,9 @@ function Get-RtfTitle {
     )
 
     try {
+        $fileInfo = [System.IO.FileInfo]::new($FilePath)
+        if ($fileInfo.Length -eq 0) { return $null }
+        if ($fileInfo.Length -gt $script:MaxFileReadBytes) { return $null }
         $rtf = Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($rtf)) { return $null }
 
@@ -1875,46 +2201,78 @@ function Get-WordComTitle {
         [string]$FilePath
     )
 
-    $wordApp = $null
-    $document = $null
+    if ($script:NoWordComMode) {
+        return $null
+    }
+
+    $timeoutMs = $script:PerFileTimeoutSeconds * 1000
+    if ($timeoutMs -le 0) { $timeoutMs = 20000 }
+
+    $runspace = $null
+    $ps = $null
 
     try {
-        $wordApp = New-Object -ComObject Word.Application
-        $wordApp.Visible = $false
-        $wordApp.DisplayAlerts = 0
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.ApartmentState = [System.Threading.ApartmentState]::STA
+        $runspace.Open()
 
-        $document = $wordApp.Documents.Open($FilePath, $false, $true, $false)
-        if (-not $document) { return $null }
+        $ps = [powershell]::Create()
+        $ps.Runspace = $runspace
+        $null = $ps.AddScript({
+            param($path)
+            $wordApp = $null
+            $document = $null
+            try {
+                $wordApp = New-Object -ComObject Word.Application
+                $wordApp.Visible = $false
+                $wordApp.DisplayAlerts = 0
+                $document = $wordApp.Documents.Open($path, $false, $true, $false)
+                if (-not $document) { return $null }
+                $title = $null
+                try { $title = [string]$document.BuiltInDocumentProperties('Title').Value } catch {}
+                if (-not [string]::IsNullOrWhiteSpace($title)) { return $title.Trim() }
+                return $null
+            }
+            catch { return $null }
+            finally {
+                if ($document) {
+                    try { $document.Close($false) | Out-Null } catch {}
+                    try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($document) } catch {}
+                }
+                if ($wordApp) {
+                    try { $wordApp.Quit() | Out-Null } catch {}
+                    try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wordApp) } catch {}
+                }
+            }
+        }).AddArgument($FilePath)
 
-        $title = $null
+        $handle = $ps.BeginInvoke()
+
+        if ($handle.AsyncWaitHandle.WaitOne($timeoutMs)) {
+            try {
+                $result = $ps.EndInvoke($handle)
+                return ($result | Select-Object -First 1)
+            }
+            catch { return $null }
+        }
+
+        # Timed out - kill the hung runspace and any orphan WINWORD processes
+        try { $ps.Stop() } catch {}
         try {
-            $title = [string]$document.BuiltInDocumentProperties('Title').Value
-        }
-        catch {
-            $title = $null
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($title)) {
-            return $title.Trim()
-        }
+            Get-Process WINWORD -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        } catch {}
+        return $null
     }
     catch {
         return $null
     }
     finally {
-        if ($document) {
-            try { $document.Close($false) | Out-Null } catch {}
-            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($document)
+        if ($ps) { try { $ps.Dispose() } catch {} }
+        if ($runspace) {
+            try { $runspace.Close() } catch {}
+            try { $runspace.Dispose() } catch {}
         }
-        if ($wordApp) {
-            try { $wordApp.Quit() | Out-Null } catch {}
-            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wordApp)
-        }
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
     }
-
-    return $null
 }
 
 function Get-EmbeddedXmpTitle {
@@ -1924,10 +2282,20 @@ function Get-EmbeddedXmpTitle {
     )
 
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($FilePath)
-        if (-not $bytes -or $bytes.Length -eq 0) { return $null }
+        $fileInfo = [System.IO.FileInfo]::new($FilePath)
+        if ($fileInfo.Length -eq 0) { return $null }
+        $readSize = [int][Math]::Min($fileInfo.Length, $script:MaxFileReadBytes)
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        try {
+            $bytes = New-Object byte[] $readSize
+            $null = $stream.Read($bytes, 0, $readSize)
+        }
+        finally {
+            $stream.Dispose()
+        }
 
         $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $bytes = $null
         $startToken = '<x:xmpmeta'
         $endToken = '</x:xmpmeta>'
 
@@ -1938,6 +2306,7 @@ function Get-EmbeddedXmpTitle {
         if ($end -lt 0) { return $null }
 
         $xmpXml = $text.Substring($start, ($end - $start) + $endToken.Length)
+        $text = $null
         [xml]$xmp = $xmpXml
 
         $titleNode = $xmp.SelectSingleNode('//*[local-name()="title"]//*[local-name()="li"]')
@@ -1988,18 +2357,97 @@ function Get-PdfBookmarkTitle {
     )
 
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($FilePath)
-        if (-not $bytes -or $bytes.Length -eq 0) { return $null }
+        $fileInfo = [System.IO.FileInfo]::new($FilePath)
+        if ($fileInfo.Length -eq 0) { return $null }
+        $readSize = [int][Math]::Min($fileInfo.Length, $script:MaxFileReadBytes)
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        try {
+            $bytes = New-Object byte[] $readSize
+            $null = $stream.Read($bytes, 0, $readSize)
+        }
+        finally {
+            $stream.Dispose()
+        }
 
         $pdfText = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+        $bytes = $null
         $titleMatches = [regex]::Matches($pdfText, '/Title\s*\((?<title>(?:\\.|[^\\)])+)\)')
 
         foreach ($match in $titleMatches) {
             $rawTitle = $match.Groups['title'].Value
             if (-not [string]::IsNullOrWhiteSpace($rawTitle)) {
-                $decoded = Unescape-PdfLiteralString -Value $rawTitle
+                $decoded = ConvertFrom-PdfLiteralString -Value $rawTitle
                 if (-not [string]::IsNullOrWhiteSpace($decoded)) {
                     return $decoded
+                }
+            }
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Get-PdfInfoTitle {
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath
+    )
+
+    try {
+        $fileInfo = [System.IO.FileInfo]::new($FilePath)
+        if ($fileInfo.Length -eq 0) { return $null }
+        # Read only the last 4KB + first 8KB where /Info dict usually lives
+        $tailSize = [int][Math]::Min($fileInfo.Length, 4096)
+        $headSize = [int][Math]::Min($fileInfo.Length, 8192)
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        try {
+            $headBytes = New-Object byte[] $headSize
+            $null = $stream.Read($headBytes, 0, $headSize)
+            $tailBytes = New-Object byte[] $tailSize
+            $null = $stream.Seek(-$tailSize, [System.IO.SeekOrigin]::End)
+            $null = $stream.Read($tailBytes, 0, $tailSize)
+        }
+        finally {
+            $stream.Dispose()
+        }
+
+        $combined = [System.Text.Encoding]::GetEncoding(28591).GetString($headBytes) + [System.Text.Encoding]::GetEncoding(28591).GetString($tailBytes)
+        $headBytes = $null
+        $tailBytes = $null
+
+        # Match /Title inside /Info dictionary (literal string or hex string)
+        $infoMatch = [regex]::Match($combined, '/Title\s*\((?<title>(?:\\.|[^\\)])+)\)', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        if ($infoMatch.Success) {
+            $rawTitle = $infoMatch.Groups['title'].Value
+            if (-not [string]::IsNullOrWhiteSpace($rawTitle)) {
+                $decoded = ConvertFrom-PdfLiteralString -Value $rawTitle
+                if (-not [string]::IsNullOrWhiteSpace($decoded)) {
+                    return $decoded
+                }
+            }
+        }
+
+        # Try hex string variant: /Title <hex>
+        $hexMatch = [regex]::Match($combined, '/Title\s*<(?<hex>[0-9A-Fa-f]+)>')
+        if ($hexMatch.Success) {
+            $hexStr = $hexMatch.Groups['hex'].Value
+            if ($hexStr.Length -ge 4 -and ($hexStr.Length % 2) -eq 0) {
+                $decodedBytes = New-Object byte[] ($hexStr.Length / 2)
+                for ($hi = 0; $hi -lt $hexStr.Length; $hi += 2) {
+                    $decodedBytes[$hi / 2] = [Convert]::ToByte($hexStr.Substring($hi, 2), 16)
+                }
+                # Detect UTF-16 BOM (FEFF)
+                $titleText = if ($decodedBytes.Length -ge 2 -and $decodedBytes[0] -eq 0xFE -and $decodedBytes[1] -eq 0xFF) {
+                    [System.Text.Encoding]::BigEndianUnicode.GetString($decodedBytes, 2, $decodedBytes.Length - 2)
+                } else {
+                    [System.Text.Encoding]::UTF8.GetString($decodedBytes)
+                }
+                $titleText = ($titleText -replace '\s+', ' ').Trim()
+                if (-not [string]::IsNullOrWhiteSpace($titleText)) {
+                    return $titleText
                 }
             }
         }
@@ -2057,11 +2505,9 @@ function Get-JpegXmpTitle {
 
 function Get-VideoMetadataName {
     param(
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellFolder,
+        $ShellFolder,
 
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellItem
+        $ShellItem
     )
 
     $mediaTitle = Get-ShellMetadataValue -ShellFolder $ShellFolder -ShellItem $ShellItem -PropertyNames @(
@@ -2093,11 +2539,9 @@ function Get-VideoMetadataName {
 
 function Get-GpsLocationLabel {
     param(
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellFolder,
+        $ShellFolder,
 
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellItem
+        $ShellItem
     )
 
     $placeName = Get-ShellMetadataValue -ShellFolder $ShellFolder -ShellItem $ShellItem -PropertyNames @(
@@ -2126,17 +2570,130 @@ function Get-GpsLocationLabel {
     return $null
 }
 
-function Get-ShellMetadataValue {
+# All Shell property names that Get-RenameBaseNameFromMetadata and its helpers may query.
+# Pre-fetching them in one batch inside a timeout-protected runspace prevents COM deadlocks.
+$script:_allShellPropertyNames = @(
+    'System.Title', 'System.Document.Title', 'System.Music.Title',
+    'System.Media.SubTitle', 'System.Subject', 'System.Keywords', 'System.Comment',
+    'System.Music.Artist', 'System.Author',
+    'System.Music.AlbumTitle', 'System.Music.TrackNumber',
+    'System.Media.Title', 'System.Media.SeasonNumber', 'System.Media.EpisodeNumber',
+    'System.Photo.DateTaken', 'System.Media.DateEncoded', 'System.Media.DateReleased',
+    'System.RecordedTV.OriginalBroadcastDate', 'System.ItemDate', 'System.DateCreated',
+    'System.Location.PlaceName', 'System.GPS.AreaInformation',
+    'System.GPS.Latitude', 'System.GPS.DestinationLatitude',
+    'System.GPS.Longitude', 'System.GPS.DestinationLongitude',
+    'System.Company', 'System.ApplicationName'
+)
+
+$script:_shellMetadataRunspace = $null
+$script:_shellPropertyCache = $null
+
+function Initialize-ShellMetadataRunspace {
+    if ($script:_shellMetadataRunspace) { return }
+    $script:_shellMetadataRunspace = [runspacefactory]::CreateRunspace()
+    $script:_shellMetadataRunspace.ApartmentState = [System.Threading.ApartmentState]::STA
+    $script:_shellMetadataRunspace.Open()
+}
+
+function Reset-ShellMetadataRunspace {
+    if ($script:_shellMetadataRunspace) {
+        try { $script:_shellMetadataRunspace.Close() } catch {}
+        try { $script:_shellMetadataRunspace.Dispose() } catch {}
+    }
+    $script:_shellMetadataRunspace = [runspacefactory]::CreateRunspace()
+    $script:_shellMetadataRunspace.ApartmentState = [System.Threading.ApartmentState]::STA
+    $script:_shellMetadataRunspace.Open()
+}
+
+function Get-AllShellFileProperties {
     param(
         [Parameter(Mandatory)]
-        [System.__ComObject]$ShellFolder,
+        [string]$DirectoryPath,
 
         [Parameter(Mandatory)]
-        [System.__ComObject]$ShellItem,
+        [string]$FileName,
+
+        [int]$TimeoutMs = 15000
+    )
+
+    Initialize-ShellMetadataRunspace
+
+    $ps = [powershell]::Create()
+    $ps.Runspace = $script:_shellMetadataRunspace
+
+    $null = $ps.AddScript({
+        param($dirPath, $fileName, $propNames)
+        if (-not $global:_shellCom) {
+            $global:_shellCom = New-Object -ComObject Shell.Application
+        }
+        if ($global:_cachedMetaDir -ne $dirPath -or -not $global:_cachedMetaFolder) {
+            if ($global:_cachedMetaFolder) {
+                try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($global:_cachedMetaFolder) } catch {}
+            }
+            $global:_cachedMetaFolder = $global:_shellCom.Namespace($dirPath)
+            $global:_cachedMetaDir = $dirPath
+        }
+        $folder = $global:_cachedMetaFolder
+        if (-not $folder) { return @{} }
+        $item = $folder.ParseName($fileName)
+        if (-not $item) { return @{} }
+        $result = @{}
+        foreach ($prop in $propNames) {
+            try {
+                $val = $item.ExtendedProperty($prop)
+                if ($null -ne $val) {
+                    $text = [string]$val
+                    if (-not [string]::IsNullOrWhiteSpace($text)) {
+                        $result[$prop] = $text.Trim()
+                    }
+                }
+            } catch {}
+        }
+        try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($item) } catch {}
+        return $result
+    }).AddArgument($DirectoryPath).AddArgument($FileName).AddArgument($script:_allShellPropertyNames)
+
+    try {
+        $handle = $ps.BeginInvoke()
+
+        if ($handle.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            try {
+                $result = $ps.EndInvoke($handle)
+                return ($result | Select-Object -First 1)
+            }
+            catch { return @{} }
+        }
+
+        # Timed out - the Shell COM call is stuck; kill and recreate the runspace
+        try { $ps.Stop() } catch {}
+        Reset-ShellMetadataRunspace
+        return $null
+    }
+    finally {
+        try { $ps.Dispose() } catch {}
+    }
+}
+
+function Get-ShellMetadataValue {
+    param(
+        $ShellFolder,
+
+        $ShellItem,
 
         [Parameter(Mandatory)]
         [string[]]$PropertyNames
     )
+
+    # Use pre-fetched property cache when available (avoids blocking COM calls)
+    if ($script:_shellPropertyCache) {
+        foreach ($prop in $PropertyNames) {
+            if ($script:_shellPropertyCache.ContainsKey($prop)) {
+                return $script:_shellPropertyCache[$prop]
+            }
+        }
+        return $null
+    }
 
     foreach ($prop in $PropertyNames) {
         try {
@@ -2158,11 +2715,9 @@ function Get-ShellMetadataValue {
 
 function Get-DateLabel {
     param(
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellFolder,
+        $ShellFolder,
 
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellItem,
+        $ShellItem,
 
         [string]$Prefix
     )
@@ -2206,11 +2761,9 @@ function Add-ContextualEnhancers {
         [Parameter(Mandatory)]
         [psobject]$BaseResult,
 
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellFolder,
+        $ShellFolder,
 
-        [Parameter(Mandatory)]
-        [System.__ComObject]$ShellItem,
+        $ShellItem,
 
         [Parameter(Mandatory)]
         [string]$Extension
@@ -2294,6 +2847,7 @@ function Get-RenameBaseNameFromMetadata {
 
     $extension = $File.Extension.ToLowerInvariant()
     $wordOpenXmlExtensions = @('.docx', '.docm', '.dotx', '.dotm')
+    $officeOpenXmlExtensions = @('.pptx', '.pptm', '.xlsx', '.xlsm')
     $wordComExtensions = @('.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm', '.rtf')
 
     $primaryResult = $null
@@ -2316,6 +2870,25 @@ function Get-RenameBaseNameFromMetadata {
         }
     }
 
+    # PPTX/XLSX/PPTM/XLSM use the same Office OpenXML ZIP structure
+    if (-not $primaryResult -and $extension -in $officeOpenXmlExtensions) {
+        $officeTitle = Get-DocxTitle -FilePath $File.FullName
+        if ($officeTitle) {
+            $sourceName = if ($extension -in @('.pptx', '.pptm')) { 'PPTX core title' } else { 'XLSX core title' }
+            $result = New-MetadataNameResult -Name $officeTitle -Source $sourceName
+            if ($result) { $primaryResult = $result }
+        }
+
+        if (-not $primaryResult) {
+            $officeHeading = Get-DocxHeadingTitle -FilePath $File.FullName
+            if ($officeHeading) {
+                $sourceName = if ($extension -in @('.pptx', '.pptm')) { 'PPTX heading title' } else { 'XLSX heading title' }
+                $result = New-MetadataNameResult -Name $officeHeading -Source $sourceName
+                if ($result) { $primaryResult = $result }
+            }
+        }
+    }
+
     if (-not $primaryResult -and $extension -eq '.rtf') {
         $rtfTitle = Get-RtfTitle -FilePath $File.FullName
         if ($rtfTitle) {
@@ -2324,7 +2897,7 @@ function Get-RenameBaseNameFromMetadata {
         }
     }
 
-    if (-not $primaryResult -and $extension -in $wordComExtensions) {
+    if (-not $primaryResult -and -not $script:NoWordComMode -and $extension -in $wordComExtensions) {
         $wordComTitle = Get-WordComTitle -FilePath $File.FullName
         if ($wordComTitle) {
             $result = New-MetadataNameResult -Name $wordComTitle -Source 'Word COM title'
@@ -2337,6 +2910,14 @@ function Get-RenameBaseNameFromMetadata {
         if ($pdfXmpTitle) {
             $result = New-MetadataNameResult -Name $pdfXmpTitle -Source 'PDF XMP title'
             if ($result) { $primaryResult = $result }
+        }
+
+        if (-not $primaryResult) {
+            $pdfInfoTitle = Get-PdfInfoTitle -FilePath $File.FullName
+            if ($pdfInfoTitle) {
+                $result = New-MetadataNameResult -Name $pdfInfoTitle -Source 'PDF Info title'
+                if ($result) { $primaryResult = $result }
+            }
         }
 
         if (-not $primaryResult) {
@@ -2364,15 +2945,19 @@ function Get-RenameBaseNameFromMetadata {
         }
     }
 
-    $shellFolder = $Shell.Namespace($File.DirectoryName)
-    if (-not $shellFolder) {
+    # Pre-fetch all Shell metadata in a timeout-protected runspace to prevent COM deadlocks
+    $shellTimeoutMs = $script:PerFileTimeoutSeconds * 1000
+    if ($shellTimeoutMs -le 0) { $shellTimeoutMs = 20000 }
+    $script:_shellPropertyCache = Get-AllShellFileProperties -DirectoryPath $File.DirectoryName -FileName $File.Name -TimeoutMs $shellTimeoutMs
+    if ($null -eq $script:_shellPropertyCache) {
+        Write-RunLog -Message ("ShellTimeout Shell metadata extraction timed out for {0}" -f $File.FullName)
         return $null
     }
 
-    $shellItem = $shellFolder.ParseName($File.Name)
-    if (-not $shellItem) {
-        return $null
-    }
+    $shellFolder = $null
+    $shellItem = $null
+
+    try {
 
     $mediaPrefix = Get-MediaPrefix -Extension $extension
 
@@ -2477,6 +3062,12 @@ function Get-RenameBaseNameFromMetadata {
     }
 
     return $null
+
+    } # end try
+    finally {
+        # Clear per-file property cache; COM objects live in the metadata runspace
+        $script:_shellPropertyCache = $null
+    }
 }
 
 $retryErrorActive = $false
@@ -2525,15 +3116,15 @@ if (-not $CsvPath) {
     $CsvPath = [System.IO.Path]::ChangeExtension($ReportPath, '.csv')
 }
 
-$shouldRecurse = -not $NoRecurse.IsPresent
+$shouldRecurse = -not $NoRecurse
 $runMode = if ($isApplyMode) { 'Apply (rename)' } else { 'Preview only' }
 if ($isImmediateRenameMode) {
     $runMode = 'Apply (rename immediate)'
 }
-if ($InteractiveSubfolders.IsPresent) {
+if ($InteractiveSubfolders) {
     $runMode = $runMode + ' + InteractiveSubfolders'
 }
-if ($QuickPreview.IsPresent) {
+if ($QuickPreview) {
     $runMode = if ($isApplyMode) {
         "Apply (rename) + QuickPreview($QuickPreviewLimit)"
     }
@@ -2545,7 +3136,7 @@ if ($QuickPreview.IsPresent) {
         $runMode = "Apply (rename immediate) + QuickPreview($QuickPreviewLimit)"
     }
 
-    if ($InteractiveSubfolders.IsPresent) {
+    if ($InteractiveSubfolders) {
         $runMode = $runMode + ' + InteractiveSubfolders'
     }
 }
@@ -2554,7 +3145,7 @@ $startupSettings = [ordered]@{
     Apply = $isApplyMode
     ImmediateRename = $isImmediateRenameMode
     QuickPreview = [bool]$QuickPreview
-    QuickPreviewLimit = if ($QuickPreview.IsPresent) { $QuickPreviewLimit } else { 'N/A' }
+    QuickPreviewLimit = if ($QuickPreview) { $QuickPreviewLimit } else { 'N/A' }
     NoRecurse = [bool]$NoRecurse
     InteractiveSubfolders = [bool]$InteractiveSubfolders
     IncludeHidden = [bool]$IncludeHidden
@@ -2567,13 +3158,20 @@ $startupSettings = [ordered]@{
     RetryErrorsActive = $retryErrorActive
     RetryErrorsLogPath = if ($retryErrorSourceLog) { $retryErrorSourceLog } elseif ($RetryErrorsLogPath) { $RetryErrorsLogPath } else { 'N/A' }
     IntelligentScan = $intelligentScanEnabled
+    UseExtensionFolders = $useExtensionFolders
     IncludeOtherFiles = $includeOtherFilesNow
     ScanOtherFilesAtEnd = $scanOtherFilesAtEndEnabled
     ListUncommonFiles = [bool]$ListUncommonFiles
     NoAutoResumePrompt = [bool]$NoAutoResumePrompt
     SkipLikelyAlreadyRenamed = [bool]$SkipLikelyAlreadyRenamed
+    SkipMetadataUpgrade = [bool]$SkipMetadataUpgrade
     PerFileTimeoutSeconds = $PerFileTimeoutSeconds
     BatchSize = $BatchSize
+    Unattended = $script:UnattendedMode
+    UseWordCom = -not $script:NoWordComMode
+    WordComDisabled = $script:NoWordComMode
+    MaxFileReadMB = $MaxFileReadMB
+    ComRecycleInterval = $script:ComRecycleInterval
     ReportPath = $ReportPath
     CsvPath = $CsvPath
     RequestedLogPath = if ([string]::IsNullOrWhiteSpace($LogPath)) { 'Auto' } else { $LogPath }
@@ -2613,12 +3211,21 @@ if ($resumeRequested) {
         }
     }
 }
-if (-not $QuickPreview.IsPresent) {
+if (-not $QuickPreview) {
     Write-Host 'Runtime controls: press P to pause, C to continue (when paused), or S to stop gracefully.' -ForegroundColor DarkYellow
 }
 Write-RunLog -Message ("Startup complete. Report path: {0}; CSV path: {1}" -f $ReportPath, $CsvPath)
 
-$items = Get-DiscoveredFiles -Root $root -IncludeHidden:$IncludeHidden.IsPresent -Recurse:$shouldRecurse -InteractiveSubfolders:$InteractiveSubfolders.IsPresent
+
+$items = Get-DiscoveredFiles -Root $root -IncludeHidden:([bool]$IncludeHidden) -Recurse:$shouldRecurse -InteractiveSubfolders:([bool]$InteractiveSubfolders)
+if ($DebugOutput.IsPresent) {
+    Write-Host ("DEBUG: After Get-DiscoveredFiles, items count: {0}" -f (@($items).Count)) -ForegroundColor Cyan
+    if (@($items).Count -eq 0) {
+        Write-Host "DEBUG: No files discovered. Check scan path, permissions, and filters." -ForegroundColor Red
+    } else {
+        Write-Host ("DEBUG: First 5 items: {0}" -f ((@($items)[0..([Math]::Min(4,(@($items).Count-1)))] | ForEach-Object { $_.FullName }) -join ', ')) -ForegroundColor Cyan
+    }
+}
 
     # If using extension folders, override $items with files from subfolders named as common Office, image, audio, or video extensions
 if ($useExtensionFolders) {
@@ -2636,7 +3243,7 @@ if ($useExtensionFolders) {
     $filteredFiles = @()
     foreach ($folder in $extFolders) {
         try {
-            $files = Get-ChildItem -LiteralPath $folder.FullName -File -Recurse -Force:$IncludeHidden.IsPresent -ErrorAction SilentlyContinue
+            $files = Get-ChildItem -LiteralPath $folder.FullName -File -Recurse -Force:([bool]$IncludeHidden) -ErrorAction SilentlyContinue
             $filteredFiles += $files
         } catch {}
     }
@@ -2681,7 +3288,7 @@ if ($intelligentScanEnabled -and -not $includeOtherFilesNow -and -not $retryErro
     else {
         $items = @($primaryItems)
         $uncommonSkipped = $deferredItems.Count
-        if ($ListUncommonFiles.IsPresent -and $deferredItems.Count -gt 0) {
+        if ($ListUncommonFiles -and $deferredItems.Count -gt 0) {
             foreach ($uncommonItem in $deferredItems) {
                 Write-Host ("[Uncommon] {0}" -f $uncommonItem.FullName) -ForegroundColor DarkYellow
                 Write-RunLog -Message ("UNCOMMON_SKIPPED | Path={0}" -f $uncommonItem.FullName)
@@ -2701,14 +3308,14 @@ if ($intelligentScanEnabled -and -not $includeOtherFilesNow -and -not $retryErro
     }
 }
 
-if ($QuickPreview.IsPresent) {
+if ($QuickPreview) {
     $items = $items | Select-Object -First $QuickPreviewLimit
     Write-Host ("Quick preview enabled: evaluating first {0} files." -f $QuickPreviewLimit) -ForegroundColor Yellow
     Write-RunLog -Message ("QuickPreview enabled. Limit={0}" -f $QuickPreviewLimit)
 }
 
 $discoveredCount = @($items).Count
-if (-not $QuickPreview.IsPresent -and $discoveredCount -ge $script:LongRunThreshold) {
+if (-not $QuickPreview -and $discoveredCount -ge $script:LongRunThreshold) {
     $longScanContext = if ($isApplyMode) {
         if ($isImmediateRenameMode) { 'before immediate rename' } else { 'before rename' }
     }
@@ -2731,14 +3338,18 @@ if (-not $QuickPreview.IsPresent -and $discoveredCount -ge $script:LongRunThresh
 
     if (-not $continueLongPreview) {
         Write-Host 'Run canceled before long scan.' -ForegroundColor Yellow
-        Write-RunLog -Message ("User canceled long scan before processing. DiscoveredFiles={0}; ApplyMode={1}" -f $discoveredCount, $Apply.IsPresent)
+        Write-RunLog -Message ("User canceled long scan before processing. DiscoveredFiles={0}; ApplyMode={1}" -f $discoveredCount, $isApplyMode)
         Write-EndOfLogCode -Status 'Run canceled by user before long scan'
         return
     }
 }
 $shell = New-Object -ComObject Shell.Application
+Initialize-ShellMetadataRunspace
 
 $reservedPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:_uniquePathCounters = $null
+$script:_cachedShellFolder = $null
+$script:_cachedShellFolderDir = $null
 $plan = [System.Collections.Generic.List[object]]::new()
 
 $renamed = 0
@@ -2748,6 +3359,7 @@ $heuristicSkipped = 0
 $timeoutSkipped = 0
 $artifactSkipped = 0
 $errorCount = 0
+$consecutiveErrors = 0
 $heartbeatEvery = 100
 $scanProcessed = 0
 $renameProcessed = 0
@@ -2758,11 +3370,23 @@ $renameErrorEntries = [System.Collections.Generic.List[object]]::new()
 
 $itemsArray = @($items)
 $totalItems = $itemsArray.Count
-$totalItemBatches = if ($totalItems -gt 0) { [int][Math]::Ceiling($totalItems / [double]$BatchSize) } else { 0 }
+$safeBatchSize = Convert-LogSettingToInt $BatchSize 100 1000000
 
-for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
-    $batchEnd = [Math]::Min($batchStart + $BatchSize - 1, $totalItems - 1)
-    $currentBatchNumber = [int]([Math]::Floor($batchStart / [double]$BatchSize) + 1)
+if ($totalItems -eq 0) {
+    Write-Host "No files discovered. Exiting." -ForegroundColor Red
+    Write-RunLog -Message "No files discovered. Exiting."
+    Write-EndOfLogCode -Status 'No files discovered.'
+    return
+}
+
+$totalItemBatches = [int][Math]::Ceiling($totalItems / [double]$safeBatchSize)
+Write-Host ("Discovered {0} files. Starting batch processing in {1} batches..." -f $totalItems, $totalItemBatches) -ForegroundColor Green
+
+try { $script:OriginalWindowTitle = $host.UI.RawUI.WindowTitle } catch {}
+
+for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $safeBatchSize) {
+    $batchEnd = [Math]::Min($batchStart + $safeBatchSize - 1, $totalItems - 1)
+    $currentBatchNumber = [int]([Math]::Floor($batchStart / [double]$safeBatchSize) + 1)
     $currentBatchCount = ($batchEnd - $batchStart + 1)
 
     if ($totalItemBatches -gt 1) {
@@ -2785,12 +3409,33 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
         $fileStopwatch = $null
         try {
             $activePhase = if ($isImmediateRenameMode) { 'rename' } elseif ($isApplyMode) { 'planning' } else { 'preview' }
-            if (-not (Handle-RunControl -Phase $activePhase)) {
+            if (-not (Test-RunControl -Phase $activePhase)) {
                 break
             }
 
             $scanProcessed++
+
+            # Update window title on every file so taskbar always shows live progress
+            Update-WindowTitle -Phase 'Scan' -Processed $scanProcessed -Total $totalItems -Renamed $renamed -Errors $errorCount -ElapsedSeconds $scanHeartbeatStopwatch.Elapsed.TotalSeconds
+
             if (($scanProcessed % $heartbeatEvery) -eq 0) {
+                # Visible console heartbeat so scrolling output proves the script is alive
+                $hbElapsed = $scanHeartbeatStopwatch.Elapsed
+                $hbPct = if ($totalItems -gt 0) { [int](($scanProcessed / $totalItems) * 100) } else { 0 }
+                Write-Host (
+                    "  [{0}] Scan progress: {1}/{2} ({3}%) | Candidates:{4} Renamed:{5} Skipped:{6} Errors:{7} | Elapsed:{8:N0}m {9:N0}s" -f
+                    (Get-Date -Format 'HH:mm:ss'),
+                    $scanProcessed,
+                    $totalItems,
+                    $hbPct,
+                    $plan.Count,
+                    $renamed,
+                    $skipped,
+                    $errorCount,
+                    [Math]::Floor($hbElapsed.TotalMinutes),
+                    $hbElapsed.Seconds
+                ) -ForegroundColor DarkGray
+
                 Write-RunLog -Message (
                     "HEARTBEAT | Phase=scan | Processed={0}/{1} | Candidates={2} | Renamed={3} | Skipped={4} | Errors={5} | ElapsedSeconds={6:N1}" -f
                     $scanProcessed,
@@ -2803,7 +3448,44 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
                 )
             }
 
-            if ($script:ResumeActive -and ($script:ResumeRenamedFrom.Contains($file.FullName) -or $script:ResumeRenamedTo.Contains($file.FullName))) {
+            # Periodic COM recycling and GC to prevent handle exhaustion and memory pressure
+            if ($script:ComRecycleInterval -gt 0 -and ($scanProcessed % $script:ComRecycleInterval) -eq 0 -and $scanProcessed -gt 0) {
+                try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) } catch {}
+                # Clear the per-directory cache since we're recycling the parent COM object
+                if ($null -ne $script:_cachedShellFolder) {
+                    try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($script:_cachedShellFolder) } catch {}
+                    $script:_cachedShellFolder = $null
+                    $script:_cachedShellFolderDir = $null
+                }
+                Reset-ShellMetadataRunspace
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
+                $shell = New-Object -ComObject Shell.Application
+                $memMB = [int]([System.Diagnostics.Process]::GetCurrentProcess().WorkingSet64 / 1MB)
+                Write-RunLog -Message ("COM_RECYCLE | Recycled Shell.Application at file #{0} | MemoryMB={1}" -f $scanProcessed, $memMB)
+                if ($memMB -gt 1500) {
+                    Write-RunLog -Message ("MEMORY_WARNING | WorkingSet={0}MB exceeds 1500MB safety threshold. Forcing aggressive GC." -f $memMB)
+                    [GC]::Collect(2, [System.GCCollectionMode]::Forced, $true)
+                    [GC]::WaitForPendingFinalizers()
+                    [GC]::Collect()
+                    $memAfter = [int]([System.Diagnostics.Process]::GetCurrentProcess().WorkingSet64 / 1MB)
+                    Write-RunLog -Message ("MEMORY_WARNING | Post-aggressive-GC MemoryMB={0}" -f $memAfter)
+                    if ($memAfter -gt 1800) {
+                        Write-Host ("  [!] MEMORY CRITICAL: {0}MB. Saving progress and exiting to prevent crash." -f $memAfter) -ForegroundColor Red
+                        Write-RunLog -Message ("MEMORY_CRITICAL | WorkingSet={0}MB. Graceful exit to prevent OS kill." -f $memAfter)
+                        Write-EndOfLogCode -Status 'Graceful exit (memory critical)'
+                        Restore-WindowTitle
+                        return
+                    }
+                }
+            }
+
+            if ($script:ResumeActive -and $script:ResumeRenamedFrom.Contains($file.FullName)) {
+                $resumeSkipped++
+                continue
+            }
+
+            if ($script:ResumeActive -and $script:ResumeRenamedTo.Contains($file.FullName) -and $SkipMetadataUpgrade) {
                 $resumeSkipped++
                 continue
             }
@@ -2815,7 +3497,7 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
                 continue
             }
 
-            if ($SkipLikelyAlreadyRenamed.IsPresent -and (Test-LikelyAlreadyRenamedName -FileName $file.Name)) {
+            if ($SkipLikelyAlreadyRenamed -and (Test-LikelyAlreadyRenamedName -FileName $file.Name)) {
                 $heuristicSkipped++
                 Write-SkippedLiveLine -FileName $file.Name -Reason 'Likely already renamed (heuristic)'
                 Write-RunLog -Message ("HeuristicSkip Name appears already-renamed: {0}" -f $file.FullName)
@@ -2823,8 +3505,13 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
             }
 
             $fileStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-            $metadataName = Get-RenameBaseNameFromMetadata -File $file -Shell $shell -Force:$Force.IsPresent -OnlyGeneric:$OnlyGeneric.IsPresent
+            $metadataName = Get-RenameBaseNameFromMetadata -File $file -Shell $shell -Force:([bool]$Force) -OnlyGeneric:([bool]$OnlyGeneric)
             $fileStopwatch.Stop()
+
+            # Hard-kill the file if the COM call takes longer than the budget
+            # (The stopwatch check below handles this since the COM release fixes prevent true hangs;
+            #  but if a COM call still manages to hang in the future, the memory watchdog
+            #  will trigger a graceful exit rather than letting the OS kill the process.)
 
             if ($fileStopwatch.Elapsed.TotalSeconds -gt $PerFileTimeoutSeconds) {
                 $timeoutSkipped++
@@ -2840,31 +3527,34 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
 
             if (-not $metadataName) {
                 $skipped++
+                $consecutiveErrors = 0
                 continue
             }
 
-
-            # Skip files that already have _renamed before the extension
-            if ($file.BaseName -match '_renamed$') {
-                $skipped++
-                Write-SkippedLiveLine -FileName $file.Name -Reason 'Already renamed (_renamed marker)'
-                Write-RunLog -Message ("RenamedSkip Already has _renamed marker: {0}" -f $file.FullName)
-                continue
-            }
-
-            # Append _renamed before the extension for the new name
             $safeBaseName = Get-SafeFileName -Name $metadataName.Name
             if (-not $safeBaseName) {
                 $skipped++
                 continue
             }
 
-            $renamedBase = $safeBaseName + '_renamed'
-            $targetPath = Get-UniqueTargetPath -Directory $file.DirectoryName -BaseName $renamedBase -Extension $file.Extension -CurrentFullName $file.FullName -ReservedPaths $reservedPaths
+            $targetPath = Get-UniqueTargetPath -Directory $file.DirectoryName -BaseName $safeBaseName -Extension $file.Extension -CurrentFullName $file.FullName -ReservedPaths $reservedPaths
 
             if ($targetPath -ieq $file.FullName) {
                 $skipped++
                 continue
+            }
+
+            # Metadata upgrade check: only re-rename if new score is strictly higher
+            if ($script:ResumeActive -and $script:ResumeRenamedTo.Contains($file.FullName) -and -not $SkipMetadataUpgrade) {
+                $prevInfo = $null
+                if ($script:ResumeRenamedScores.TryGetValue($file.FullName, [ref]$prevInfo)) {
+                    if ($metadataName.ConfidenceScore -le $prevInfo.Score) {
+                        $skipped++
+                        Write-RunLog -Message ("UpgradeSkip No improvement for {0}. New={1}/{2}; Previous={3}/{4}" -f $file.FullName, $metadataName.Source, $metadataName.ConfidenceScore, $prevInfo.Source, $prevInfo.Score)
+                        continue
+                    }
+                    Write-RunLog -Message ("MetadataUpgrade Upgrading {0}. New={1}/{2}; Previous={3}/{4}" -f $file.FullName, $metadataName.Source, $metadataName.ConfidenceScore, $prevInfo.Source, $prevInfo.Score)
+                }
             }
 
             $targetName = [System.IO.Path]::GetFileName($targetPath)
@@ -2880,9 +3570,14 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
             }) | Out-Null
 
             $lastAdded = $plan[$plan.Count - 1]
+            $consecutiveErrors = 0
             if ($isImmediateRenameMode) {
                 $immediateTargetPath = Join-Path -Path (Split-Path -Path $lastAdded.FullPath -Parent) -ChildPath $lastAdded.NewName
-                if ($script:ResumeActive -and ($script:ResumeRenamedFrom.Contains($lastAdded.FullPath) -or $script:ResumeRenamedTo.Contains($immediateTargetPath))) {
+                if ($script:ResumeActive -and $script:ResumeRenamedFrom.Contains($lastAdded.FullPath)) {
+                    $resumeSkipped++
+                    continue
+                }
+                if ($script:ResumeActive -and $SkipMetadataUpgrade -and $script:ResumeRenamedTo.Contains($immediateTargetPath)) {
                     $resumeSkipped++
                     continue
                 }
@@ -2904,6 +3599,7 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
             }
 
             $errorCount++
+            $consecutiveErrors++
             $errorMessage = if ($_.Exception -and -not [string]::IsNullOrWhiteSpace($_.Exception.Message)) { $_.Exception.Message } else { $_.ToString() }
             Write-ErrorLiveLine -FileName $file.Name -Reason 'Processing error (see run log)'
             $null = $processingErrorFiles.Add($file.FullName)
@@ -2911,8 +3607,26 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
             Write-RunLog -Message ("ERROR | Phase=processing | File={0} | NewName= | Message={1}" -f $file.FullName, $errorMessageFlat)
             Write-RunLog -Message ("ErrorSkip File processing failed for {0}. Error={1}" -f $file.FullName, $errorMessage)
 
-            if ($errorMessage -match '(?i)com object|rpc server|disconnected|invalid') {
+            if ($consecutiveErrors -ge 50) {
+                Write-RunLog -Message ("CIRCUIT BREAKER: {0} consecutive errors - force-recycling COM and running GC" -f $consecutiveErrors)
+                Write-Host ("  [!] Circuit breaker: {0} consecutive errors - recycling COM..." -f $consecutiveErrors) -ForegroundColor Red
                 try {
+                    Reset-ShellMetadataRunspace
+                    [GC]::Collect()
+                    [GC]::WaitForPendingFinalizers()
+                    $shell = New-Object -ComObject Shell.Application
+                    Write-RunLog -Message 'Circuit breaker: COM recycled successfully.'
+                }
+                catch {
+                    Write-RunLog -Message 'Circuit breaker: Failed to recycle COM.'
+                }
+                $consecutiveErrors = 0
+            }
+            elseif ($errorMessage -match '(?i)com object|rpc server|disconnected|invalid|out of memory|e_fail') {
+                try {
+                    Reset-ShellMetadataRunspace
+                    [GC]::Collect()
+                    [GC]::WaitForPendingFinalizers()
                     $shell = New-Object -ComObject Shell.Application
                     Write-RunLog -Message 'Recovered Shell.Application COM object after processing error.'
                 }
@@ -2935,6 +3649,10 @@ for ($batchStart = 0; $batchStart -lt $totalItems; $batchStart += $BatchSize) {
             $currentBatchNumber,
             $totalItemBatches
         )
+
+        # Force GC at batch boundaries to reduce memory pressure
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
     }
 }
 
@@ -2970,7 +3688,7 @@ if ($processingErrorFiles.Count -gt 0) {
                 }
 
                 $fileStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                $metadataName = Get-RenameBaseNameFromMetadata -File $retryFile -Shell $shell -Force:$Force.IsPresent -OnlyGeneric:$OnlyGeneric.IsPresent
+                $metadataName = Get-RenameBaseNameFromMetadata -File $retryFile -Shell $shell -Force:([bool]$Force) -OnlyGeneric:([bool]$OnlyGeneric)
                 $fileStopwatch.Stop()
 
                 if ($fileStopwatch.Elapsed.TotalSeconds -gt $PerFileTimeoutSeconds) {
@@ -3033,7 +3751,14 @@ if ($processingErrorFiles.Count -gt 0) {
 }
 
 $lines = [System.Collections.Generic.List[string]]::new()
-$reportKind = if ($isImmediateRenameMode) { 'Rename' } elseif ($isApplyMode) { 'Plan' } else { 'Preview' }
+$reportKind = ''
+if ($isImmediateRenameMode) {
+    $reportKind = 'Rename'
+} elseif ($isApplyMode) {
+    $reportKind = 'Plan'
+} else {
+    $reportKind = 'Preview'
+}
 $lines.Add("$reportKind generated on: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')") | Out-Null
 $lines.Add("Root path: $root") | Out-Null
 $lines.Add("") | Out-Null
@@ -3126,7 +3851,7 @@ if (-not $isApplyMode) {
         return
     }
 
-    $applyPrompt = if ($QuickPreview.IsPresent) {
+    $applyPrompt = if ($QuickPreview) {
         'Quick preview complete. Continue to rename these sampled files now?'
     }
     else {
@@ -3146,7 +3871,7 @@ if (-not $isApplyMode) {
     Write-RunLog -Message 'User confirmed apply at end-of-preview prompt.'
 }
 
-if (-not $QuickPreview.IsPresent -and -not $isImmediateRenameMode -and $plan.Count -ge $script:LongRunThreshold) {
+if (-not $QuickPreview -and -not $isImmediateRenameMode -and $plan.Count -ge $script:LongRunThreshold) {
     Write-Host (
         "Large rename set detected ({0} files). Runtime controls: P = pause, C = continue (while paused), S = stop gracefully." -f $plan.Count
     ) -ForegroundColor Yellow
@@ -3163,14 +3888,95 @@ if (-not $QuickPreview.IsPresent -and -not $isImmediateRenameMode -and $plan.Cou
 if (-not $isImmediateRenameMode) {
     $planEntries = @($plan)
     $totalPlanEntries = $planEntries.Count
-    $totalRenameBatches = if ($totalPlanEntries -gt 0) { [int][Math]::Ceiling($totalPlanEntries / [double]$BatchSize) } else { 0 }
+    $safeBatchSize = Convert-LogSettingToInt $BatchSize 100 1000000
+    $totalRenameBatches = if ($totalPlanEntries -gt 0) { [int][Math]::Ceiling($totalPlanEntries / [double]$safeBatchSize) } else { 0 }
 
-    for ($renameBatchStart = 0; $renameBatchStart -lt $totalPlanEntries; $renameBatchStart += $BatchSize) {
-        $renameBatchEnd = [Math]::Min($renameBatchStart + $BatchSize - 1, $totalPlanEntries - 1)
-        $currentRenameBatch = [int]([Math]::Floor($renameBatchStart / [double]$BatchSize) + 1)
+    for ($renameBatchStart = 0; $renameBatchStart -lt $totalPlanEntries; $renameBatchStart += $safeBatchSize) {
+        $renameBatchEnd = [Math]::Min($renameBatchStart + $safeBatchSize - 1, $totalPlanEntries - 1)
+        $currentRenameBatch = [int]([Math]::Floor($renameBatchStart / [double]$safeBatchSize) + 1)
         if ($totalRenameBatches -gt 1) {
             Write-Host ("Applying batch {0}/{1} renames..." -f $currentRenameBatch, $totalRenameBatches) -ForegroundColor DarkYellow
             Write-RunLog -Message ("BatchStart | Phase=rename | Batch={0}/{1}" -f $currentRenameBatch, $totalRenameBatches)
+        }
+
+        for ($ri = $renameBatchStart; $ri -le $renameBatchEnd; $ri++) {
+            $entry = $planEntries[$ri]
+
+            if (-not (Test-RunControl -Phase 'rename')) {
+                break
+            }
+
+            $renameProcessed++
+
+            # Update window title on every rename
+            Update-WindowTitle -Phase 'Apply' -Processed $renameProcessed -Total $totalPlanEntries -Renamed $renamed -Errors $errorCount -ElapsedSeconds $renameHeartbeatStopwatch.Elapsed.TotalSeconds
+
+            if (($renameProcessed % $heartbeatEvery) -eq 0) {
+                # Visible console heartbeat for rename phase
+                $hbElapsed = $renameHeartbeatStopwatch.Elapsed
+                $hbPct = if ($totalPlanEntries -gt 0) { [int](($renameProcessed / $totalPlanEntries) * 100) } else { 0 }
+                Write-Host (
+                    "  [{0}] Rename progress: {1}/{2} ({3}%) | Renamed:{4} Errors:{5} | Elapsed:{6:N0}m {7:N0}s" -f
+                    (Get-Date -Format 'HH:mm:ss'),
+                    $renameProcessed,
+                    $totalPlanEntries,
+                    $hbPct,
+                    $renamed,
+                    $errorCount,
+                    [Math]::Floor($hbElapsed.TotalMinutes),
+                    $hbElapsed.Seconds
+                ) -ForegroundColor DarkGray
+
+                Write-RunLog -Message (
+                    "HEARTBEAT | Phase=rename | Processed={0}/{1} | Renamed={2} | Errors={3} | ElapsedSeconds={4:N1}" -f
+                    $renameProcessed,
+                    $totalPlanEntries,
+                    $renamed,
+                    $errorCount,
+                    $renameHeartbeatStopwatch.Elapsed.TotalSeconds
+                )
+            }
+
+            if ($script:ResumeActive) {
+                $renameTargetPath = Join-Path -Path (Split-Path -Path $entry.FullPath -Parent) -ChildPath $entry.NewName
+                if ($script:ResumeRenamedFrom.Contains($entry.FullPath) -or $script:ResumeRenamedTo.Contains($renameTargetPath)) {
+                    $resumeSkipped++
+                    continue
+                }
+            }
+
+            try {
+                if (-not (Test-Path -LiteralPath $entry.FullPath)) {
+                    Write-RunLog -Message ("RenameSkip File no longer exists: {0}" -f $entry.FullPath)
+                    continue
+                }
+
+                if ($PSCmdlet.ShouldProcess($entry.FullPath, "Rename to '$($entry.NewName)'")) {
+                    Rename-Item -LiteralPath $entry.FullPath -NewName $entry.NewName -ErrorAction Stop
+                    $renamed++
+                    Write-RenameLiveLine -Action 'RENAMED' -Entry $entry
+                }
+            }
+            catch {
+                $errorCount++
+                $renameMessage = if ($_.Exception -and -not [string]::IsNullOrWhiteSpace($_.Exception.Message)) { $_.Exception.Message } else { $_.ToString() }
+                Write-ErrorLiveLine -FileName $entry.OldName -Reason 'Rename failed (see run log)'
+                $renameMessageFlat = (($renameMessage -replace '\|', '/') -replace "`r?`n", ' ').Trim()
+                Write-RunLog -Message ("ERROR | Phase=rename | File={0} | NewName={1} | Message={2}" -f $entry.FullPath, $entry.NewName, $renameMessageFlat)
+                $renameErrorEntries.Add($entry) | Out-Null
+            }
+        }
+
+        if ($script:StopRequested) {
+            break
+        }
+
+        if ($totalRenameBatches -gt 1) {
+            Write-RunLog -Message ("BatchComplete | Phase=rename | Batch={0}/{1}" -f $currentRenameBatch, $totalRenameBatches)
+
+            # Force GC at rename batch boundaries
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
         }
     }
 
@@ -3230,4 +4036,10 @@ else {
 }
 Write-Host ("Run log: {0}" -f $script:LogPath)
 Write-RunLog -Message ("Apply complete. Renamed={0}; Skipped={1}; UncommonSkipped={2}; ResumeSkipped={3}; ArtifactSkipped={4}; HeuristicSkipped={5}; ERROR={6}; TIMEOUT={7}" -f $renamed, $skipped, $uncommonSkipped, $resumeSkipped, $artifactSkipped, $heuristicSkipped, $errorCount, $timeoutSkipped)
+if ($script:_shellMetadataRunspace) {
+    try { $script:_shellMetadataRunspace.Close() } catch {}
+    try { $script:_shellMetadataRunspace.Dispose() } catch {}
+    $script:_shellMetadataRunspace = $null
+}
+Restore-WindowTitle
 Write-EndOfLogCode -Status 'Run completed'
